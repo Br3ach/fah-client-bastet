@@ -37,6 +37,7 @@
 #include "OS.h"
 #include "Remote.h"
 #include "LogTracker.h"
+#include "CPUResources.h"
 
 #include <cbang/Catch.h>
 #include <cbang/Info.h>
@@ -439,6 +440,8 @@ void App::loadConfig() {
   d->insert("pid",         SystemUtilities::getPID());
   d->insert("cwd",         SystemUtilities::getcwd());
 
+  updateCPUInfo();
+
   Info &info = Info::instance();
   d->insert("mode",               info.get(getName(), "Mode"));
   d->insert("revision",           info.get(getName(), "Revision"));
@@ -482,6 +485,46 @@ void App::loadConfig() {
   if (db.has("config")) config->load(*db.getJSON("config"));
 
   insert("config", config);
+}
+
+
+void App::updateCPUInfo() {
+  if (!hasDict("info")) return;
+
+  auto d = get("info");
+  auto cpuAffinity = createDict();
+  cpuAffinity->insert("capability",
+    cpuResources->hasHardAffinity() ? "hard" : "none");
+  cpuAffinity->insert("available",
+    (uint32_t)cpuResources->getAvailableCPUs().size());
+  cpuAffinity->insert("topology_generation",
+    cpuResources->getTopologyGeneration());
+  cpuAffinity->insert("allocation_generation",
+    cpuResources->getAllocationGeneration());
+  cpuAffinity->insertBoolean("class_selection",
+    cpuResources->hasPerformanceClasses());
+  cpuAffinity->insertBoolean("effective_classes",
+    cpuResources->hasEffectivePerformanceClasses());
+  cpuAffinity->insertBoolean("smt_topology",
+    !cpuResources->getCoreThreads().empty());
+  cpuAffinity->insertBoolean("managed", cpuResources->isManaged());
+  cpuAffinity->insertBoolean("runtime_fallback",
+    cpuResources->isRuntimeFallback());
+  cpuAffinity->insert("runtime_fallback_reason",
+    cpuResources->getRuntimeFallbackReason());
+
+  auto cpuLevels = createList();
+  auto &raw = cpuResources->getRawPerformanceLevels();
+  auto &effective = cpuResources->getPerformanceLevels();
+  for (unsigned i = 0; i < raw.size(); i++) {
+    auto item = createDict();
+    item->insert("logical_cpus", (uint32_t)raw[i].size());
+    item->insert("available_logical_cpus",
+      (uint32_t)(i < effective.size() ? effective[i].size() : 0));
+    cpuLevels->append(item);
+  }
+  cpuAffinity->insert("performance_levels", cpuLevels);
+  d->insert("cpu_affinity", cpuAffinity);
 }
 
 
@@ -570,13 +613,61 @@ void App::setup() {
 
   // Initialize
   upgradeDB();
+  cpuResources = new CPUResources();
   loadConfig();
   insert("groups", new Groups(*this));
   insert("units", new Units(*this));
+  getGroups()->triggerUpdate();
+
+  // Periodic reconciliation catches topology changes without frequent probing.
+  // Configuration validation also refreshes topology before applying CPU policy.
+  const unsigned topologyRefreshInterval = 300;
+  LOG_INFO(3, "CPU topology watcher enabled: interval="
+    << topologyRefreshInterval << "s");
+  cpuRefreshEvent = base.newEvent([this, topologyRefreshInterval] {
+    bool changed = cpuResources->refreshTopology("periodic");
+    LOG_DEBUG(2, "CPU topology periodic refresh complete: changed=" << changed
+      << " generation=" << cpuResources->getTopologyGeneration());
+    if (changed) getGroups()->triggerUpdate();
+    cpuRefreshEvent->add(topologyRefreshInterval);
+  }, 0);
+  cpuRefreshEvent->add(topologyRefreshInterval);
+}
+
+
+void App::beginGroupConfigNotifications() {
+  if (groupConfigNotificationsDeferred)
+    THROW("Nested group configuration notification batch");
+  groupConfigNotificationsDeferred = true;
+}
+
+
+void App::endGroupConfigNotifications(bool publish) {
+  if (!groupConfigNotificationsDeferred) return;
+  groupConfigNotificationsDeferred = false;
+  if (!publish || remotes.empty() || shouldQuit()) return;
+
+  // Existing connected clients accept path updates, not a second initial
+  // root object. Send deep-copied final trees through the existing protocol.
+  // Each tree is committed/restored state; there is no cross-message atomicity.
+  try {
+    auto snapshot = SmartPtr(new JSON::Dict);
+    for (auto key: {"groups", "units", "info"})
+      if (has(key)) snapshot->insert(key, get(key)->copy(true));
+    for (auto key: {"groups", "units", "info"}) {
+      if (!snapshot->has(key)) continue;
+      auto changes = SmartPtr(new JSON::List);
+      changes->append(key);
+      changes->append(snapshot->get(key));
+      for (auto &remote: remotes)
+        TRY_CATCH_ERROR(remote->sendChanges(changes));
+    }
+  } CATCH_ERROR;
 }
 
 
 void App::notify(const list<JSON::ValuePtr> &change) {
+  if (groupConfigNotificationsDeferred) return;
   if (remotes.empty() || shouldQuit()) return; // Avoid many calls during init
 
   // Automatically save changes to config

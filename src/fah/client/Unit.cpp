@@ -32,7 +32,9 @@
 #include "OS.h"
 #include "Server.h"
 #include "GPUResources.h"
+#include "CPUResources.h"
 #include "Groups.h"
+#include "Units.h"
 #include "Core.h"
 #include "CoreProcess.h"
 #include "Cores.h"
@@ -213,6 +215,20 @@ bool Unit::isRunning() const {return process.isSet();}
 
 void Unit::setCPUs(uint32_t cpus) {
   if (!hasU32("cpus") || cpus != getCPUs()) insert("cpus", cpus);
+}
+
+
+void Unit::setCPUAffinity(bool managed, const std::set<unsigned> &cpus) {
+  if (managed != affinityManaged || cpus != affinityCPUs)
+    LOG_DEBUG(1, "Desired CPU affinity changed: old-managed=" << affinityManaged
+      << " old=" << CPUResources::formatCPUs(affinityCPUs)
+      << " new-managed=" << managed
+      << " new=" << CPUResources::formatCPUs(cpus));
+  else
+    LOG_DEBUG(2, "Desired CPU affinity unchanged: managed=" << managed
+      << " cpus=" << CPUResources::formatCPUs(cpus));
+  affinityManaged = managed;
+  affinityCPUs = cpus;
 }
 
 
@@ -450,7 +466,14 @@ void Unit::next() {
 
       // Only interrupt after minimum run time to give the core time to
       // install it's interrupt handlers.
-      if (isPaused() || getState() != UNIT_RUN || getCPUs() != runningCPUs) {
+      bool affinityChanged = affinityManaged != runningAffinityManaged ||
+        getDesiredAffinity() != runningAffinityCPUs;
+      if (isPaused() || getState() != UNIT_RUN || getCPUs() != runningCPUs ||
+          affinityChanged) {
+        if (affinityChanged)
+          LOG_DEBUG(1, "Restarting FahCore for CPU affinity change: running="
+            << CPUResources::formatCPUs(runningAffinityCPUs)
+            << " desired=" << CPUResources::formatCPUs(getDesiredAffinity()));
         const unsigned minRuntime = 5;
         auto delta = getRunTimeDelta();
         if (minRuntime <= delta) return stopRun();
@@ -511,6 +534,9 @@ void Unit::processEnded() {
   erase("start_time");
   erase("pid");
   processStartTime = 0;
+  runningCPUs = 0;
+  runningAffinityManaged = false;
+  runningAffinityCPUs.clear();
 }
 
 
@@ -607,8 +633,44 @@ void Unit::getCore() {
 }
 
 
+bool Unit::blocksCPULaunch(const Unit &running) const {
+  // The process reference is retained throughout asynchronous shutdown.
+  // GPU helper threads are shared and do not own exclusive CPU reservations.
+  if (hasGPUs() || running.hasGPUs() || !running.process.isSet()) return false;
+  if (!affinityManaged && !running.runningAffinityManaged) return false;
+  // An unpinned CPU process may occupy any CPU during a mode transition.
+  if (!affinityManaged || !running.runningAffinityManaged) return true;
+  for (auto cpu: affinityCPUs)
+    if (running.runningAffinityCPUs.count(cpu)) return true;
+  return false;
+}
+
+
+std::set<unsigned> Unit::getDesiredAffinity() const {
+  if (affinityManaged) return affinityCPUs;
+  const auto &cpu = app.getCPUResources();
+  if (!getConfig().getPinToPerfCores() || !cpu.hasPerformanceClasses()) return {};
+  const auto &levels = cpu.getPerformanceLevels();
+  if (levels.empty() || (!hasGPUs() && levels.front().size() < getCPUs())) return {};
+  return levels.front();
+}
+
+
 void Unit::run() {
   if (process.isSet()) return; // Already running
+
+  if (affinityManaged && affinityCPUs.empty()) {
+    LOG_DEBUG(2, "Waiting for a non-empty CPU allocation");
+    return triggerNext(1);
+  }
+  auto units = app.getUnits();
+  for (unsigned i = 0; i < units->size(); ++i) {
+    auto running = units->getUnit(i);
+    if (running.get() != this && blocksCPULaunch(*running)) {
+      LOG_DEBUG(2, "Waiting for CPU reservation held by WU " << running->getID());
+      return triggerNext(1);
+    }
+  }
 
   // Make sure WU data exists
   if (!SystemUtilities::exists(getDirectory() + "/wudata_01.dat")) {
@@ -635,6 +697,13 @@ void Unit::run() {
   args.push_back(String(SystemUtilities::getPID()));
 
   runningCPUs = getCPUs();
+  runningAffinityManaged = affinityManaged;
+  runningAffinityCPUs = getDesiredAffinity();
+  LOG_DEBUG(1, "Launching FahCore: group='" << group->getName()
+    << "' type=" << (hasGPUs() ? "GPU" : "CPU")
+    << " cpus=" << runningCPUs
+    << " affinity-managed=" << runningAffinityManaged
+    << " affinity=" << CPUResources::formatCPUs(runningAffinityCPUs));
 
   auto &gpus = *get("gpus");
   if (gpus.size()) {
@@ -674,17 +743,11 @@ void Unit::run() {
   // Run
   auto process = SmartPtr(new CoreProcess(core->getPath()));
 
-  // Pin to performance cores on hybrid CPUs
-  if (getConfig().getPinToPerfCores()) {
-    auto cpus = SystemInfo::instance().getPerformanceCPUs();
-
-    if (cpus.empty()) LOG_INFO(3, "No performance cores detected, not pinning");
-    else if (!gpus.size() && cpus.size() < runningCPUs)
-      LOG_INFO(3, "More CPUs allocated than performance cores, not pinning");
-    else {
-      LOG_INFO(3, "Pinning core to " << cpus.size() << " performance CPUs");
-      process->setAffinity(cpus);
-    }
+  if (!runningAffinityCPUs.empty()) {
+    LOG_INFO(3, "Applying FahCore CPU affinity "
+      << CPUResources::formatCPUs(runningAffinityCPUs));
+    if (affinityManaged) process->setRequiredAffinity(runningAffinityCPUs);
+    else process->setAffinity(runningAffinityCPUs);
   }
 
   process->exec(args);
