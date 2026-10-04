@@ -79,6 +79,12 @@ namespace FAH {
       double   wait        = 0;
       int      cs          = -1;
       uint32_t runningCPUs = 0;
+      bool blocksCPULaunch(const Unit &running) const;
+      std::set<unsigned> getDesiredAffinity() const;
+      bool affinityManaged = false;
+      bool runningAffinityManaged = false;
+      std::set<unsigned> affinityCPUs;
+      std::set<unsigned> runningAffinityCPUs;
 
       uint64_t processStartTime = 0; // Core process start time
       uint64_t lastSkewTimer    = 0; // For detecting clock skew
@@ -121,6 +127,9 @@ namespace FAH {
       bool isRunning() const;
 
       void setCPUs(uint32_t cpus);
+      void setCPUAffinity(bool managed, const std::set<unsigned> &cpus);
+      bool isCPUAffinityManaged() const {return affinityManaged;}
+      const std::set<unsigned> &getCPUAffinity() const {return affinityCPUs;}
       uint32_t getCPUs() const {return getU32("cpus");}
       uint32_t getMinCPUs() const;
       uint32_t getMaxCPUs() const;

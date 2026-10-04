@@ -1,6 +1,18 @@
 Folding@home Client Changelog
 =============================
 
+## Unreleased
+ - Suspend managed CPU work if an internal overlapping allocation is detected, rather than publishing conflicting masks.
+ - Keep GPU work running when only its accounted helper CPU count changes, including managed/General scheduling transitions. GPU affinity changes still restart the core.
+ - Automatically allocate disjoint, SMT-aware CPU masks for General-mode groups on confirmed homogeneous systems with hard affinity and valid core topology. Overcommitted runtime counts are fairly reduced without changing saved requests; GPU helpers use the existing managed scheduling policy. Unknown topology and all-General hybrid systems retain legacy scheduling.
+ - Add per-resource-group CPU performance-class allocations with disjoint logical CPU masks, physical-core-first ordering and SMT sibling ownership preference.
+ - Preserve saved CPU policies across topology changes and fairly reduce runtime allocations when capacity is insufficient.
+ - Apply managed affinity before launching CPU cores and wait for conflicting running cores to release their reservations.
+ - Validate and stage group configuration before applying it, restore live state on database failure and defer remote notifications until reconciliation.
+ - In managed mode, GPU work uses its core's minimum CPU allowance outside the exclusive CPU-folding budget; helpers no longer expand into leftover group CPU budget.
+ - Enforce performance-core logical CPU limits for General-mode pinning and refresh topology every five minutes and during configuration validation.
+ - Log changed RG allocations and policies at informational level 3, and rate-limit SMT reservation search-limit notices to once every five minutes.
+
 ## v8.5.7
  - Uniform handling of non-PCI GPUs types. re:#455
  - Added ``pin_to_perf_cores`` group option. re:#349

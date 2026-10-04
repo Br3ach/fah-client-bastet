@@ -89,6 +89,7 @@ namespace FAH {
 
       const std::string &getName() const {return name;}
       Config &getConfig() const {return *config;}
+      void replaceConfig(const cb::SmartPointer<Config> &next);
       Units units() const;
 
       void setState(const cb::JSON::Value &msg);
