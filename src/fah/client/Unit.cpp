@@ -32,9 +32,12 @@
 #include "OS.h"
 #include "Server.h"
 #include "GPUResources.h"
+#include "CPUResources.h"
 #include "Groups.h"
+#include "Units.h"
 #include "Core.h"
 #include "CoreProcess.h"
+#include "CPUExecutionPlan.h"
 #include "Cores.h"
 #include "Config.h"
 #include "ExitCode.h"
@@ -213,6 +216,47 @@ bool Unit::isRunning() const {return process.isSet();}
 
 void Unit::setCPUs(uint32_t cpus) {
   if (!hasU32("cpus") || cpus != getCPUs()) insert("cpus", cpus);
+}
+
+
+void Unit::setCPUAffinity(bool managed, const std::set<unsigned> &cpus) {
+  if (managed != affinityManaged || cpus != affinityCPUs)
+    LOG_DEBUG(1, "Desired CPU affinity changed: old-managed=" << affinityManaged
+      << " old=" << CPUResources::formatCPUs(affinityCPUs)
+      << " new-managed=" << managed
+      << " new=" << CPUResources::formatCPUs(cpus));
+  else
+    LOG_DEBUG(2, "Desired CPU affinity unchanged: managed=" << managed
+      << " cpus=" << CPUResources::formatCPUs(cpus));
+  affinityManaged = managed;
+  affinityCPUs = cpus;
+  affinityAllocationGeneration = app.getCPUResources().getAllocationGeneration();
+}
+
+
+cb::JSON::ValuePtr Unit::getCPUExecutionInfo() const {
+  // Describe the scheduler's current plan, not an old process still stopping.
+  if (!affinityManaged || hasGPUs() || !atRunState() || isPaused() ||
+      !core.isSet() || affinityCPUs.empty() ||
+      affinityAllocationGeneration != app.getCPUResources().getAllocationGeneration()) return 0;
+  auto plan = CPUExecutionPlan::create(core->getType(), getCPUs(), affinityCPUs,
+    app.getCPUResources().getCoreThreads());
+  auto info = createDict();
+  info->insert("group", group->getName());
+  info->insert("number", getU64("number"));
+  info->insert("allocated_workers", getCPUs());
+  info->insert("logical_cpus", (uint32_t)plan.mask.size());
+  info->insert("physical_cpus", min<unsigned>(plan.physical, plan.mask.size()));
+  info->insert("pool_physical_cpus", plan.physical);
+  info->insert("pool_logical_cpus", plan.logical);
+  info->insertBoolean("full_smt", plan.fullSMT);
+  const auto &policy = getConfig();
+  info->insert("configured_cpus", policy.getConfiguredCPUTotal());
+  info->insert("cpu_mode", policy.getCPUMode());
+  auto counts = createList();
+  for (auto count: policy.getCPUClassCounts()) counts->append(count);
+  info->insert("cpu_class_counts", counts);
+  return info;
 }
 
 
@@ -450,7 +494,22 @@ void Unit::next() {
 
       // Only interrupt after minimum run time to give the core time to
       // install it's interrupt handlers.
-      if (isPaused() || getState() != UNIT_RUN || getCPUs() != runningCPUs) {
+      bool affinityChanged = desiredAffinityManaged() != runningAffinityManaged ||
+        desiredGPUReservation() != runningGPUReservation ||
+        getDesiredAffinity() != runningAffinityCPUs ||
+        getDesiredResourceCPUs() != runningResourceCPUs;
+      // GPU CPU counts account for helper resources; only CPU cores receive
+      // this count through -np. Affinity changes still restart either type.
+      bool cpuCountChanged = !hasGPUs() && getCPUs() != runningCPUs;
+      if (isPaused() || getState() != UNIT_RUN || cpuCountChanged ||
+          affinityChanged) {
+        if (cpuCountChanged || affinityChanged)
+          LOG_DEBUG(1, "Restarting FahCore for CPU configuration change:"
+            << " cpus=" << runningCPUs << "->" << getCPUs()
+            << " affinity-managed=" << runningAffinityManaged << "->"
+            << affinityManaged << " affinity="
+            << CPUResources::formatCPUs(runningAffinityCPUs) << "->"
+            << CPUResources::formatCPUs(getDesiredAffinity()));
         const unsigned minRuntime = 5;
         auto delta = getRunTimeDelta();
         if (minRuntime <= delta) return stopRun();
@@ -488,6 +547,24 @@ void Unit::next() {
     case UNIT_DUMP:     return dump();
     case UNIT_DONE:     return;
     }
+  } catch (const AffinityRejected &e) {
+    const auto generation = app.getCPUResources().getTopologyGeneration();
+    if (rejectedTopologyGeneration != generation || rejectedAffinityCPUs != runningAffinityCPUs)
+      affinityRejections = 0;
+    rejectedTopologyGeneration = generation;
+    rejectedAffinityCPUs = runningAffinityCPUs;
+    affinityRejections = std::min(affinityRejections + 1, 7u);
+    const unsigned delay = affinityRejections < 3 ? 5 :
+      std::min(300u, 30u << (affinityRejections - 3));
+    insert("affinity_failure_reason", std::string(e.what()));
+    insert("affinity_retry_delay", delay);
+    LOG_WARNING(e.what() << "; refreshing CPU topology, retry in " << delay << " seconds");
+    setWait(delay); // Scheduler callbacks observe the same launch cooldown.
+    app.getCPUResources().refreshTopology("affinity-rejected");
+    app.triggerUpdate();
+    // A stable topology can still reject affinity. Avoid spinning or charging
+    // an environmental launch failure to the work unit retry budget.
+    return triggerNext(delay);
   } CATCH_ERROR;
 
   retry();
@@ -495,6 +572,10 @@ void Unit::next() {
 
 
 void Unit::processStarted(const SmartPointer<CoreProcess> &process) {
+  affinityRejections = 0;
+  rejectedAffinityCPUs.clear();
+  erase("affinity_failure_reason");
+  erase("affinity_retry_delay");
   auto pid = process->getPID();
   LOG_INFO(3, "Started FahCore on PID " << pid);
   this->process = process;
@@ -511,6 +592,11 @@ void Unit::processEnded() {
   erase("start_time");
   erase("pid");
   processStartTime = 0;
+  runningCPUs = 0;
+  runningAffinityManaged = false;
+  runningGPUReservation = false;
+  runningAffinityCPUs.clear();
+  runningResourceCPUs.clear();
 }
 
 
@@ -607,8 +693,80 @@ void Unit::getCore() {
 }
 
 
+bool Unit::desiredGPUReservation() const {
+  return hasGPUs() && getConfig().getGPUReservedCores() != 0;
+}
+
+
+bool Unit::desiredAffinityManaged() const {
+  if (!hasGPUs()) return affinityManaged;
+  return desiredGPUReservation() || app.getCPUResources().supportsGPUAffinity();
+}
+
+
+bool Unit::blocksCPULaunch(const Unit &running) const {
+  if (!running.process.isSet()) return false;
+  // Shared GPU helpers may overlap CPU work. Exclusive GPU masks must wait
+  // for both old CPU processes and old GPU processes to release their masks.
+  if ((hasGPUs() || running.hasGPUs()) &&
+      !desiredGPUReservation() && !running.runningGPUReservation) return false;
+  bool managed = desiredAffinityManaged();
+  if (!managed && !running.runningAffinityManaged) return false;
+  if (!managed || !running.runningAffinityManaged) return true;
+  // Hold whole-core ownership until the old process exits, including siblings
+  // omitted from its smaller process mask at N <= physical capacity.
+  for (auto cpu: getDesiredResourceCPUs())
+    if (running.runningResourceCPUs.count(cpu)) return true;
+  return false;
+}
+
+
+std::set<unsigned> Unit::getDesiredAffinity() const {
+  const auto &cpu = app.getCPUResources();
+  if (hasGPUs() && desiredAffinityManaged()) {
+    std::set<unsigned> mask;
+    for (const auto &gpu: getGPUs()) {
+      const auto &reserved = cpu.getGPUCPUs(group->getName(), gpu);
+      // Every GPU in a multi-GPU WU must have its required helper pool.
+      if (reserved.empty()) return {};
+      mask.insert(reserved.begin(), reserved.end());
+    }
+    return mask;
+  }
+  if (affinityManaged) return CPUExecutionPlan::create(
+    core.isSet() ? core->getType() : 0, getCPUs(), affinityCPUs,
+    cpu.getCoreThreads(), cpu.getGroupCPUs(group->getName())).mask;
+  return {}; // Unmanaged CPU work uses ordinary OS scheduling.
+}
+
+
+std::set<unsigned> Unit::getDesiredResourceCPUs() const {
+  if (!hasGPUs() && affinityManaged) return affinityCPUs;
+  return getDesiredAffinity();
+}
+
+
 void Unit::run() {
   if (process.isSet()) return; // Already running
+
+  if (desiredAffinityManaged() && getDesiredAffinity().empty()) {
+    if (hasGPUs() && !allocationBlockedLogged) {
+      LOG_WARNING("GPU folding in RG '" << group->getName()
+        << "' is waiting for helper CPUs; check GPU Performance 1 reservations and current topology");
+      allocationBlockedLogged = true;
+    }
+    LOG_DEBUG(2, "Waiting for a non-empty CPU allocation");
+    return triggerNext(1);
+  }
+  allocationBlockedLogged = false;
+  auto units = app.getUnits();
+  for (unsigned i = 0; i < units->size(); ++i) {
+    auto running = units->getUnit(i);
+    if (running.get() != this && blocksCPULaunch(*running)) {
+      LOG_DEBUG(2, "Waiting for CPU reservation held by WU " << running->getID());
+      return triggerNext(1);
+    }
+  }
 
   // Make sure WU data exists
   if (!SystemUtilities::exists(getDirectory() + "/wudata_01.dat")) {
@@ -635,6 +793,15 @@ void Unit::run() {
   args.push_back(String(SystemUtilities::getPID()));
 
   runningCPUs = getCPUs();
+  runningAffinityManaged = desiredAffinityManaged();
+  runningGPUReservation = desiredGPUReservation();
+  runningAffinityCPUs = getDesiredAffinity();
+  runningResourceCPUs = getDesiredResourceCPUs();
+  LOG_DEBUG(1, "Launching FahCore: group='" << group->getName()
+    << "' type=" << (hasGPUs() ? "GPU" : "CPU")
+    << " cpus=" << runningCPUs
+    << " affinity-managed=" << runningAffinityManaged
+    << " affinity=" << CPUResources::formatCPUs(runningAffinityCPUs));
 
   auto &gpus = *get("gpus");
   if (gpus.size()) {
@@ -674,17 +841,19 @@ void Unit::run() {
   // Run
   auto process = SmartPtr(new CoreProcess(core->getPath()));
 
-  // Pin to performance cores on hybrid CPUs
-  if (getConfig().getPinToPerfCores()) {
-    auto cpus = SystemInfo::instance().getPerformanceCPUs();
+  if (runningAffinityManaged) {
+    LOG_INFO(3, "Applying FahCore CPU affinity "
+      << CPUResources::formatCPUs(runningAffinityCPUs));
+    process->setRequiredAffinity(runningAffinityCPUs);
+  }
 
-    if (cpus.empty()) LOG_INFO(3, "No performance cores detected, not pinning");
-    else if (!gpus.size() && cpus.size() < runningCPUs)
-      LOG_INFO(3, "More CPUs allocated than performance cores, not pinning");
-    else {
-      LOG_INFO(3, "Pinning core to " << cpus.size() << " performance CPUs");
-      process->setAffinity(cpus);
-    }
+  if (!hasGPUs() && runningAffinityManaged) {
+    auto plan = CPUExecutionPlan::create(core->getType(), runningCPUs,
+      affinityCPUs, app.getCPUResources().getCoreThreads());
+    if (plan.fullSMT)
+      LOG_WARNING("Full SMT utilisation may reduce performance: " << runningCPUs
+        << " workers use all hardware threads of " << plan.physical
+        << " allocated physical cores. Consider one fewer worker and compare performance.");
   }
 
   process->exec(args);

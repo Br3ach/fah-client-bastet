@@ -79,6 +79,22 @@ namespace FAH {
       double   wait        = 0;
       int      cs          = -1;
       uint32_t runningCPUs = 0;
+      bool blocksCPULaunch(const Unit &running) const;
+      bool desiredAffinityManaged() const;
+      bool desiredGPUReservation() const;
+      bool runningGPUReservation = false;
+      std::set<unsigned> getDesiredAffinity() const;
+      std::set<unsigned> getDesiredResourceCPUs() const;
+      bool affinityManaged = false;
+      uint64_t affinityAllocationGeneration = 0;
+      bool allocationBlockedLogged = false;
+      bool runningAffinityManaged = false;
+      std::set<unsigned> affinityCPUs;
+      std::set<unsigned> runningAffinityCPUs;
+      std::set<unsigned> runningResourceCPUs;
+      std::set<unsigned> rejectedAffinityCPUs;
+      uint64_t rejectedTopologyGeneration = 0;
+      unsigned affinityRejections = 0;
 
       uint64_t processStartTime = 0; // Core process start time
       uint64_t lastSkewTimer    = 0; // For detecting clock skew
@@ -121,7 +137,9 @@ namespace FAH {
       bool isRunning() const;
 
       void setCPUs(uint32_t cpus);
+      void setCPUAffinity(bool managed, const std::set<unsigned> &cpus);
       uint32_t getCPUs() const {return getU32("cpus");}
+      cb::JSON::ValuePtr getCPUExecutionInfo() const;
       uint32_t getMinCPUs() const;
       uint32_t getMaxCPUs() const;
       void setGPUs(const std::set<std::string> &gpus);

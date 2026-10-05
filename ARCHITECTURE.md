@@ -75,13 +75,14 @@ can be added at runtime by remotes.
 1. Triggers each unit's `next()`.
 2. Reaps completed units.
 3. Honors graceful shutdown.
-4. Bails if paused, idle-waiting, battery-waiting, or assigning.
+4. Bails if paused, idle-waiting, battery-waiting, GPU-waiting, or in group backoff.
 5. Allocates GPUs (each GPU WU gets its minimum CPUs).
 6. Distributes extra CPUs to enabled GPU WUs up to their max.
 7. Distributes remaining CPUs to CPU WUs.
 8. Sets `pause` on units that didn't get resources.
-9. Creates a new Unit (calls `Units::add`) if under the max-WU cap and
-   any resources are still free.
+9. Waits for any pending assignment after reconciling existing WUs.
+10. Creates a new Unit (calls `Units::add`) if under the max-WU cap and
+    any resources are still free.
 
 ### Config (`Config.h/cpp`)
 
@@ -199,3 +200,61 @@ to attached Remotes.
 Every state change in any observable JSON child triggers `App::notify`
 (`App.cpp:550`), which forwards a JSON change-list to all Remotes.
 The frontend sees the same JSON tree the client owns.
+
+
+## CPU policy, runtime ownership and live affinity
+
+These are three distinct layers. Do not substitute a process mask for a pool,
+or overwrite saved policy when runtime capacity changes.
+
+1. **Saved policy (`Config`, `Groups`).** CPU worker counts, performance-class
+   counts and physical cores reserved per enabled usable GPU express intent.
+   API configuration stages and validates group settings before applying them.
+   SQLite rollback restores persistence and the original live group/WU objects.
+   Unchanged saved class settings survive temporary topology loss. Notification
+   batching publishes final trees, but does not make separate network messages
+   atomic or make combined global/group persistence one SQLite transaction.
+2. **Runtime pools (`CPUResources`, `CPUExecutionPlan::partition`, `Group`).**
+   Positive GPU reservations get separate complete Performance 1 physical cores
+   first. Their logical CPUs are excluded from every CPU pool and shared GPU
+   helper pool. Zero-reservation GPUs share the remaining Performance 1 pool
+   with each other and CPU work. CPU pools own whole cores and remain disjoint
+   across groups and WUs. Worker budgets cannot exceed pool logical capacity.
+   Whole-core granularity may reduce a budget without changing saved counts.
+   Explicit classes take priority, followed by fair General targets, physical
+   spreading that preserves achievable General budgets, and spare-core expansion.
+   Missing core maps use deterministic logical pools without claiming physical
+   isolation. General hybrid/unknown configurations without classes or GPU
+   reservations retain legacy scheduling. Homogeneous supported topology uses
+   managed allocation. Pending assignments must not delay pool reconciliation.
+3. **Live process masks (`Unit`, `CoreProcess`).** For a8/a9, N workers at or
+   below P owned physical cores use exactly N logical CPUs on separate cores.
+   Above P, the process can use the entire owned logical pool without changing N.
+   Other core types use matching-size process masks. The client never identifies
+   or pins individual GROMACS/OpenMP workers. Full SMT is an advisory warning,
+   based on workload-specific measurements, not an automatic worker reduction.
+
+A smaller process mask still reserves its entire owned physical-core pool.
+When settings change, the desired pool can change immediately, but the old
+process retains its live reservation until it exits. `Unit::blocksCPULaunch`
+checks desired ownership against those live reservations. Shared GPU helpers
+are not exclusive owners, but an exclusive GPU reservation must wait for old
+CPU or GPU work using its resources. Restart is asynchronous and uses the
+normal graceful-stop timeout. It must not be assumed complete when config saves.
+
+Strict Windows/Linux launch applies and verifies the exact mask before allowing
+core execution. An empty managed mask waits. A positive GPU reservation that
+cannot be satisfied waits and publishes its shortage reason, never becomes
+shared or unrestricted. A strict affinity rejection refreshes topology and
+reconciles pools immediately, with a separate bounded retry cooldown instead of
+ordinary WU retries. Windows masks must fit the supported processor group and
+Linux IDs must fit `cpu_set_t`; unsupported masks are rejected, never truncated.
+
+The periodic topology probe runs every 300 seconds, and configuration validation
+also probes. Running-process changes are not monitored continuously. Before
+reconciliation, the OS may restrict an existing process or leave it with an old
+mask depending on the platform and change. After detection, conflicting launches
+wait for live ownership to be released. This preserves ownership safety, but
+does not promise uninterrupted folding or instant detection of every hot-plug
+or cpuset change. Real hybrid hardware and live cgroup/processor-group changes
+require integration testing beyond synthetic allocator fixtures.

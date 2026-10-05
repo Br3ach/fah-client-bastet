@@ -1,6 +1,28 @@
 Folding@home Client Changelog
 =============================
 
+## Unreleased
+ - Validate shared GPU enablement against existing reservations and spread explicit CPU classes over physical cores where General worker budgets permit.
+ - Remove the legacy pin_to_perf_cores option. Use CPU performance-class allocation and GPU reservations for resource selection.
+ - Use process affinity only for a8/a9. At or below the assigned physical-core count, expose one logical CPU per core. Above it, expose the complete SMT pool owned by the work unit, while retaining the requested worker count.
+ - Remove experimental worker detection and thread pinning and the global SMT sibling preference. OpenMP and the OS place threads inside the process mask.
+ - Reserve complete Performance 1 physical cores per enabled GPU before CPU allocation. Each GPU receives a separate mask. Zero shares the remaining performance pool.
+ - Separate exclusive whole-core pools from worker budgets across resource groups and simultaneous CPU work units. Keep physical-core reservations until old processes exit. Whole-core capacity shortages reduce runtime workers without rewriting saved settings.
+ - Publish per-group worker counts, physical/logical pool capacities and full-SMT status. Warn only at full SMT utilisation and never automatically subtract a worker.
+ - Affinity-rejected launches refresh topology without consuming WU retries. Combined global and group edits reconcile and publish once.
+ - Reject GPU reservations that starve shared helper groups and report runtime GPU shortages.
+ - Validate GPU reservations and CPU allocations together, wait for conflicting processes during reservation changes, and retain saved reservations when GPUs are disabled or topology changes.
+ - Suspend managed CPU work if an internal overlapping allocation is detected, rather than publishing conflicting masks.
+ - Keep GPU work running when only its accounted helper CPU count changes, including managed/General scheduling transitions. GPU affinity changes still restart the core.
+ - Automatically allocate disjoint, SMT-aware CPU masks for General-mode groups on confirmed homogeneous systems with hard affinity and valid core topology. Overcommitted runtime counts are fairly reduced without changing saved requests; GPU helpers use the existing managed scheduling policy. Unknown topology and all-General hybrid systems retain legacy scheduling.
+ - Add per-resource-group CPU performance-class allocations with disjoint logical CPU masks, physical-core-first ordering.
+ - Preserve saved CPU policies across topology changes and fairly reduce runtime allocations when capacity is insufficient.
+ - Apply managed affinity before launching CPU cores and wait for conflicting running cores to release their reservations.
+ - Validate and stage group configuration before applying it, restore live state on database failure and defer remote notifications until reconciliation.
+ - In managed mode, GPU work uses its core's minimum CPU allowance outside the exclusive CPU-folding budget; helpers no longer expand into leftover group CPU budget.
+ - Refresh topology every five minutes and during configuration validation.
+ - Log changed RG allocations and policies at informational level 3.
+
 ## v8.5.7
  - Uniform handling of non-PCI GPUs types. re:#455
  - Added ``pin_to_perf_cores`` group option. re:#349

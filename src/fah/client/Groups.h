@@ -39,6 +39,7 @@ namespace FAH {
 
     class Groups : public cb::JSON::ObservableDict {
       App &app;
+      bool configuring = false;
 
     public:
       Groups(App &app);
@@ -47,6 +48,9 @@ namespace FAH {
       Group &getGroup(const std::string &name);
       void delGroup(const std::string &name);
       void configure(const cb::JSON::Value &configs);
+      cb::JSON::ValuePtr proposeConfiguration(const cb::JSON::Value &configs) const;
+      void validateCPUConfiguration(const cb::JSON::Value &configs) const;
+      bool isConfiguring() const {return configuring;}
       void triggerUpdate();
       void setState(const cb::JSON::Value &msg);
       bool getPaused() const;

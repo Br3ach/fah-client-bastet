@@ -60,6 +60,7 @@ namespace FAH {
     class OS;
     class Remote;
     class LogTracker;
+    class CPUResources;
 
     class App :
       public cb::Application,
@@ -84,6 +85,11 @@ namespace FAH {
       cb::SmartPointer<Cores>        cores;
       cb::SmartPointer<OS>           os;
       cb::SmartPointer<LogTracker>   logTracker;
+      cb::SmartPointer<CPUResources> cpuResources;
+
+      cb::Event::EventPtr cpuRefreshEvent;
+      unsigned groupConfigNotificationsDeferred = 0;
+      bool groupReconciliationDeferred = false;
 
       std::list<cb::SmartPointer<Remote>> remotes;
 
@@ -103,6 +109,7 @@ namespace FAH {
       cb::HTTP::Client &getClient()    {return client;}
       cb::KeyPair      &getKey()       {return key;}
 
+      cb::DB::Database &getDatabase() {return db;}
       cb::DB::NameValueTable &getDB(
         const std::string name, bool ordered = false);
 
@@ -112,6 +119,13 @@ namespace FAH {
       Cores            &getCores()      {return *cores;}
       OS               &getOS()         {return *os;}
       LogTracker       &getLogTracker() {return *logTracker;}
+      CPUResources     &getCPUResources() {return *cpuResources;}
+      const CPUResources &getCPUResources() const {return *cpuResources;}
+
+      void updateCPUInfo();
+      bool isGroupReconciliationDeferred() const {return groupReconciliationDeferred;}
+      void beginGroupConfigNotifications();
+      void endGroupConfigNotifications(bool publish);
 
       cb::SmartPointer<Groups> getGroups() const;
       cb::SmartPointer<Config> getConfig() const;

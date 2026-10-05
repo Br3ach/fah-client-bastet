@@ -30,6 +30,7 @@
 
 #include <cbang/json/Observable.h>
 #include <cbang/config/Options.h>
+#include <vector>
 
 
 namespace FAH {
@@ -54,7 +55,12 @@ namespace FAH {
       bool getOnIdle() const;
       bool getOnBattery() const;
       bool getKeepAwake() const;
-      bool getPinToPerfCores() const;
+      uint32_t getGPUReservedCores() const;
+      std::string getCPUMode() const;
+      bool usesCPUClasses() const;
+      std::vector<uint32_t> getCPUClassCounts() const;
+      uint32_t getConfiguredCPUTotal() const;
+      std::string getCPUConfigDescription() const;
       void setPaused(bool paused);
       bool getPaused() const;
       bool getFinish() const;

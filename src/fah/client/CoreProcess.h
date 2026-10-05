@@ -29,11 +29,22 @@
 #pragma once
 
 #include <cbang/os/Subprocess.h>
+#include <memory>
+#include <stdexcept>
 
 
 namespace FAH {
   namespace Client {
+    class AffinityRejected : public std::runtime_error {
+    public:
+      AffinityRejected() : std::runtime_error("Required FahCore CPU affinity could not be applied exactly") {}
+    };
+
     class CoreProcess : public cb::Subprocess {
+      struct StrictProcess;
+      std::unique_ptr<StrictProcess> strictProcess;
+      std::set<unsigned> requiredAffinity;
+      void execStrict(const std::vector<std::string> &args);
       const std::string path;
       uint64_t interruptTime  = 0;
       uint64_t lastStop       = 0;
@@ -41,6 +52,13 @@ namespace FAH {
 
     public:
       CoreProcess(const std::string &path);
+      ~CoreProcess();
+      void setRequiredAffinity(const std::set<unsigned> &cpus);
+      bool isRunning();
+      uint64_t getPID() const;
+      int wait(bool nonblocking = false);
+      bool kill(bool nonblocking = false);
+      void interrupt();
 
       // True once the core has been asked to stop, until it exits
       bool isStopping() const {return interruptTime;}

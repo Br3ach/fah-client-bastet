@@ -27,16 +27,21 @@
 \******************************************************************************/
 
 #include "Group.h"
+#include "CPUExecutionPlan.h"
+#include "Groups.h"
 #include "App.h"
 #include "OS.h"
 #include "Config.h"
 #include "GPUResources.h"
+#include "CPUResources.h"
 
 #include <cbang/util/Resource.h>
 #include <cbang/log/Logger.h>
 #include <cbang/json/Reader.h>
 
 #include <cmath>
+#include <algorithm>
+#include <map>
 
 using namespace std;
 using namespace cb;
@@ -63,6 +68,7 @@ Group::Group(App &app, const string &name) :
 
   if (db.has(name)) config->load(*db.getJSON(name));
 
+  LOG_DEBUG(1, "Loaded RG CPU policy: " << config->getCPUConfigDescription());
   insert("config", config);
 
   triggerUpdate();
@@ -169,13 +175,21 @@ void Group::save()   {app.getDB("groups").set(name, config->toString());}
 void Group::remove() {app.getDB("groups").unset(name);}
 
 
+void Group::replaceConfig(const SmartPointer<Config> &next) {
+  insert("config", next);
+  config = get("config").cast<Config>();
+}
+
+
 void Group::notify(const list<JSON::ValuePtr> &change) {
   // Automatically save changes to config
   bool isConfig = 2 < change.size() && change.front()->getString() == "config";
 
   if (isConfig) {
-    save();
-    triggerUpdate();
+    if (!app.getGroups()->isConfiguring()) save();
+    LOG_DEBUG(2, "RG config observable changed; cpu-policy={"
+      << config->getCPUConfigDescription() << "}");
+    if (!app.getGroups()->isConfiguring()) app.triggerUpdate();
   }
 }
 
@@ -212,15 +226,27 @@ void Group::update() {
     return;
   }
 
-  // No further action if waiting
+  // Scheduling pauses still stop resource reconciliation. A pending
+  // assignment must not prevent existing WUs from adopting changed pools.
   if (config->getPaused() || waitForIdle() || waitOnBattery() || waitOnGPU() ||
-      isAssigning() || Time::now() < waitUntil)
+      Time::now() < waitUntil)
     return event->add(0.25); // Check again later
 
   // Allocate resources
-  unsigned         remainingCPUs = config->getCPUs();
+  auto &cpuResources = app.getCPUResources();
+  bool managed = cpuResources.isManaged();
+  auto groupCPUs = cpuResources.getGroupCPUs(name);
+  unsigned remainingCPUs = managed ? cpuResources.getGroupWorkerCount(name) : config->getCPUs();
   std::set<string> remainingGPUs = config->getGPUs();
   std::set<string> enabledWUs;
+  std::map<string, uint32_t> gpuBaseCPUs;
+
+  LOG_DEBUG(1, "RG CPU scheduling begin: config={"
+    << config->getCPUConfigDescription() << "} managed=" << managed
+    << " allocation-generation=" << cpuResources.getAllocationGeneration()
+    << " runtime-fallback=" << cpuResources.isRuntimeFallback()
+    << " fallback-reason='" << cpuResources.getRuntimeFallbackReason()
+    << "' rg-mask=" << CPUResources::formatCPUs(groupCPUs));
 
   // Allocate GPUs with minimum CPU requirements
   for (auto unit: units()) {
@@ -229,16 +255,26 @@ void Group::update() {
     auto unitGPUs = unit->getGPUs();
     if (unitGPUs.empty()) continue;
 
-    uint32_t minCPUs  = unit->getMinCPUs();
-    bool     runnable = minCPUs <= remainingCPUs || minCPUs < 2;
+    uint32_t minCPUs = unit->getMinCPUs();
+    uint32_t baseCPUs = managed ? std::max<uint32_t>(1, minCPUs) : minCPUs;
+    // GPU helper threads are not part of the exclusive CPU-folding budget.
+    bool runnable = managed || minCPUs <= remainingCPUs || minCPUs < 2;
+
+    LOG_DEBUG(2, "GPU WU candidate " << unit->getID()
+      << ": min=" << minCPUs << " managed-base=" << baseCPUs
+      << " remaining-rg-cpus=" << remainingCPUs
+      << " runnable-before-gpu-check=" << runnable);
 
     std::set<string> gpusWithWU = remainingGPUs;
     for (auto id: unitGPUs) runnable &= gpusWithWU.erase(id) != 0;
 
     if (runnable) {
       remainingGPUs = gpusWithWU;
-      remainingCPUs -= min(remainingCPUs, minCPUs); // Allocate minimum CPUs
+      if (!managed) remainingCPUs -= min(remainingCPUs, baseCPUs);
+      gpuBaseCPUs[unit->getID()] = baseCPUs;
       enabledWUs.insert(unit->getID());
+      LOG_DEBUG(1, "GPU WU " << unit->getID() << " helper CPUs=" << baseCPUs
+        << " shared=" << managed << "; remaining RG CPUs=" << remainingCPUs);
     }
   }
 
@@ -247,13 +283,14 @@ void Group::update() {
     // GPU WUs that were enabled above
     if (!enabledWUs.count(unit->getID())) continue;
 
-    uint32_t minCPUs = unit->getMinCPUs();
-    uint32_t maxCPUs = unit->getMaxCPUs();
-    uint32_t cpus    = min(maxCPUs, remainingCPUs + minCPUs);
+    uint32_t baseCPUs = gpuBaseCPUs[unit->getID()];
+    uint32_t maxCPUs = std::max(baseCPUs, unit->getMaxCPUs());
+    uint32_t cpus = managed ? baseCPUs : min(maxCPUs, remainingCPUs + baseCPUs);
 
     unit->setCPUs(cpus);
-    // minCPUs was subtracted above or remainingCPUs is already zero
-    remainingCPUs -= min(remainingCPUs, cpus - minCPUs);
+    if (!managed) remainingCPUs -= min(remainingCPUs, cpus - baseCPUs);
+    LOG_DEBUG(2, "GPU WU " << unit->getID() << " final CPU count="
+      << cpus << " remaining RG CPUs=" << remainingCPUs);
   }
 
   // Allocate remaining CPUs to existing CPU WUs
@@ -267,6 +304,32 @@ void Group::update() {
     unit->setCPUs(cpus);
     remainingCPUs -= cpus;
     enabledWUs.insert(unit->getID());
+    LOG_DEBUG(1, "CPU WU " << unit->getID() << " allocated " << cpus
+      << " CPU(s); remaining RG CPUs=" << remainingCPUs);
+  }
+
+  // Separate worker counts from exclusive whole-core process pools. Multiple
+  // CPU WUs in the same RG must not expand into each other's SMT siblings.
+  if (managed) {
+    std::map<string, unsigned> requests;
+    for (auto unit: units())
+      if (!unit->hasGPUs() && enabledWUs.count(unit->getID()))
+        requests[unit->getID()] = unit->getCPUs();
+    auto pools = CPUExecutionPlan::partition(requests, groupCPUs,
+      cpuResources.getCoreThreads());
+    for (auto unit: units()) {
+      if (unit->hasGPUs()) {unit->setCPUAffinity(false, {}); continue;}
+      auto &pool = pools[unit->getID()];
+      if (enabledWUs.count(unit->getID())) {
+        unsigned workers = std::min<unsigned>(unit->getCPUs(), pool.size());
+        if (workers < unit->getMinCPUs()) {
+          enabledWUs.erase(unit->getID()); pool.clear();
+        } else unit->setCPUs(workers);
+      }
+      unit->setCPUAffinity(true, pool);
+    }
+  } else {
+    for (auto unit: units()) unit->setCPUAffinity(false, {});
   }
 
   // Start and stop WUs, based on resource availability
@@ -278,9 +341,16 @@ void Group::update() {
     LOG_DEBUG(3, "Unit " << unit->getID() << (pause ? " paused" : " enabled"));
   }
 
+  // Publish per-WU plans only after CPU budgets, pools and pause state agree.
+  app.updateCPUInfo();
+
   // Report allocation status
   LOG_DEBUG(1, "Remaining CPUs: " << remainingCPUs << ", Remaining GPUs: "
     << remainingGPUs.size() << ", Active WUs: " << enabledWUs.size());
+
+  // Keep one assignment at a time, after reconciling existing WUs. This
+  // includes assignment retries, which must not retain stale CPU ownership.
+  if (isAssigning()) return event->add(0.25);
 
   // Handle finish, don't add any new WUs
   if (config->getFinish()) {
@@ -290,7 +360,10 @@ void Group::update() {
 
   // Add new WU if we don't already have too many and there are some resources
   const unsigned maxWUs = config->getGPUs().size() + config->getCPUs() / 64 + 3;
-  if (wuCount < maxWUs && (remainingCPUs || remainingGPUs.size())) {
+  bool assignable = remainingCPUs || remainingGPUs.size();
+
+
+  if (wuCount < maxWUs && assignable) {
     app.getUnits()->add(
       new Unit(app, name, app.getNextWUID(), remainingCPUs, remainingGPUs));
     LOG_INFO(1, "Added new work unit: cpus:" << remainingCPUs << " gpus:"

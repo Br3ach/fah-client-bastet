@@ -35,6 +35,10 @@
 #include <cbang/json/Reader.h>
 #include <cbang/os/SystemInfo.h>
 
+#include <algorithm>
+#include <limits>
+#include <sstream>
+
 using namespace FAH::Client;
 using namespace cb;
 using namespace std;
@@ -87,8 +91,48 @@ bool Config::getOnBattery() const {return getBoolean("on_battery");}
 bool Config::getKeepAwake() const {return getBoolean("keep_awake");}
 
 
-bool Config::getPinToPerfCores() const {
-  return getBoolean("pin_to_perf_cores", false);
+uint32_t Config::getGPUReservedCores() const {
+  return getU32("gpu_reserved_cores", 0);
+}
+
+
+string Config::getCPUMode() const {return getString("cpu_mode", "count");}
+
+
+bool Config::usesCPUClasses() const {return getCPUMode() == "classes";}
+
+
+vector<uint32_t> Config::getCPUClassCounts() const {
+  vector<uint32_t> counts;
+  if (!hasList("cpu_class_counts")) return counts;
+  for (auto value: *get("cpu_class_counts")) counts.push_back(value->getU32());
+  return counts;
+}
+
+
+uint32_t Config::getConfiguredCPUTotal() const {
+  if (!usesCPUClasses()) return getU32("cpus", 0);
+
+  uint64_t total = 0;
+  for (auto count: getCPUClassCounts()) total += count;
+  return (uint32_t)min<uint64_t>(total, numeric_limits<uint32_t>::max());
+}
+
+
+string Config::getCPUConfigDescription() const {
+  ostringstream out;
+  out << "mode=" << getCPUMode()
+      << " cpus=" << getConfiguredCPUTotal();
+  if (usesCPUClasses()) {
+    out << " classes=[";
+    auto counts = getCPUClassCounts();
+    for (unsigned i = 0; i < counts.size(); i++) {
+      if (i) out << ',';
+      out << counts[i];
+    }
+    out << ']';
+  }
+  return out.str();
 }
 
 
@@ -124,7 +168,7 @@ bool Config::getBeta(const std::set<string> &gpus) const {
 
 uint32_t Config::getCPUs() const {
   uint32_t maxCPUs = SystemInfo::instance().getCPUCount();
-  uint32_t cpus    = getU32("cpus");
+  uint32_t cpus    = getConfiguredCPUTotal();
   return maxCPUs < cpus ? maxCPUs : cpus;
 }
 

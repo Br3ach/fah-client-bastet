@@ -27,6 +27,7 @@
 \******************************************************************************/
 
 #include "App.h"
+#include "CPUExecutionPlan.h"
 #include "Server.h"
 #include "Account.h"
 #include "GPUResources.h"
@@ -37,6 +38,7 @@
 #include "OS.h"
 #include "Remote.h"
 #include "LogTracker.h"
+#include "CPUResources.h"
 
 #include <cbang/Catch.h>
 #include <cbang/Info.h>
@@ -257,15 +259,30 @@ SmartPointer<Units> App::getUnits() const {
 void App::configure(const JSON::Value &msg) {
   if (!validateChange(msg)) return;
 
+  beginGroupConfigNotifications();
+  groupReconciliationDeferred = true;
+  struct ConfigurationGuard {
+    App &app;
+    bool &deferred;
+    ~ConfigurationGuard() {
+      if (deferred) {
+        deferred = false;
+        TRY_CATCH_ERROR(app.triggerUpdate());
+      }
+      TRY_CATCH_ERROR(app.endGroupConfigNotifications(true));
+    }
+  } guard{*this, groupReconciliationDeferred};
   if (msg.hasDict("config")) {
     auto config = msg.get("config");
-
-    if (config->hasDict("groups"))
+    if (config->hasDict("groups")) {
       getGroups()->configure(*config->get("groups"));
-
+    }
     getConfig()->configure(*config);
   }
 
+  // Reconcile once with both final policies. The guard also reconciles on
+  // failure and guarantees publication if this update throws.
+  groupReconciliationDeferred = false;
   triggerUpdate();
 }
 
@@ -439,6 +456,8 @@ void App::loadConfig() {
   d->insert("pid",         SystemUtilities::getPID());
   d->insert("cwd",         SystemUtilities::getcwd());
 
+  updateCPUInfo();
+
   Info &info = Info::instance();
   d->insert("mode",               info.get(getName(), "Mode"));
   d->insert("revision",           info.get(getName(), "Revision"));
@@ -482,6 +501,124 @@ void App::loadConfig() {
   if (db.has("config")) config->load(*db.getJSON("config"));
 
   insert("config", config);
+}
+
+
+void App::updateCPUInfo() {
+  if (!hasDict("info")) return;
+
+  auto d = get("info");
+  auto cpuAffinity = createDict();
+  cpuAffinity->insert("capability",
+    cpuResources->hasHardAffinity() ? "hard" : "none");
+  cpuAffinity->insert("available",
+    (uint32_t)cpuResources->getAvailableCPUs().size());
+  cpuAffinity->insert("topology_generation",
+    cpuResources->getTopologyGeneration());
+  cpuAffinity->insert("allocation_generation",
+    cpuResources->getAllocationGeneration());
+  cpuAffinity->insertBoolean("class_selection",
+    cpuResources->hasPerformanceClasses());
+  cpuAffinity->insertBoolean("effective_classes",
+    cpuResources->hasEffectivePerformanceClasses());
+  cpuAffinity->insertBoolean("smt_topology",
+    !cpuResources->getCoreThreads().empty());
+  cpuAffinity->insertBoolean("managed", cpuResources->isManaged());
+  cpuAffinity->insertBoolean("runtime_fallback",
+    cpuResources->isRuntimeFallback());
+  cpuAffinity->insert("runtime_fallback_reason",
+    cpuResources->getRuntimeFallbackReason());
+
+  cpuAffinity->insertBoolean("gpu_cpu_reservation",
+    cpuResources->supportsGPUAffinity());
+  cpuAffinity->insert("allocatable",
+    (uint32_t)cpuResources->getAllocatableCPUs().size());
+  auto fastCores = createList();
+  for (const auto &core: cpuResources->getFastPhysicalCores())
+    fastCores->append((uint32_t)core.size());
+  cpuAffinity->insert("performance1_core_threads", fastCores);
+
+  auto physicalCount = [&](const CPUResources::CPUSet &mask) {
+    unsigned count = 0;
+    CPUResources::CPUSet covered;
+    for (const auto &core: cpuResources->getCoreThreads()) {
+      bool used = false;
+      for (auto cpu: core) if (mask.count(cpu)) {covered.insert(cpu); used = true;}
+      if (used) ++count;
+    }
+    return covered == mask ? count : 0;
+  };
+  cpuAffinity->insert("physical_cpus", physicalCount(cpuResources->getAvailableCPUs()));
+  auto groupAllocations = createDict();
+  auto blockedGPUHelpers = createDict();
+  if (has("groups")) for (const auto &name: getGroups()->keys()) {
+    if (cpuResources->isManaged()) {
+      const auto &ordered = cpuResources->getGroupCPUs(name);
+      CPUResources::CPUSet mask(ordered.begin(), ordered.end());
+      auto allocation = createDict();
+      unsigned workers = cpuResources->getGroupWorkerCount(name);
+      auto plan = CPUExecutionPlan::create(0xa8, workers, mask,
+        cpuResources->getCoreThreads(), ordered);
+      allocation->insert("logical_cpus", (uint32_t)plan.mask.size());
+      allocation->insert("physical_cpus", physicalCount(plan.mask));
+      allocation->insert("pool_logical_cpus", (uint32_t)mask.size());
+      allocation->insert("pool_physical_cpus", physicalCount(mask));
+      allocation->insert("allocated_workers", workers);
+      allocation->insertBoolean("has_smt", plan.hasSMT);
+      allocation->insertBoolean("smt_in_use", plan.physical && plan.mask.size() > plan.physical);
+      allocation->insertBoolean("full_smt", plan.fullSMT);
+      const auto &policy = getGroups()->getGroup(name).getConfig();
+      allocation->insert("configured_cpus", policy.getConfiguredCPUTotal());
+      allocation->insert("cpu_mode", policy.usesCPUClasses() ? "classes" : "count");
+      auto counts = createList();
+      for (auto count: policy.getCPUClassCounts()) counts->append(count);
+      allocation->insert("cpu_class_counts", counts);
+      groupAllocations->insert(name, allocation);
+    }
+    const auto &config = getGroups()->getGroup(name).getConfig();
+    bool helperBlocked = false;
+    string shortageReasons;
+    for (const auto &gpu: config.getGPUs()) {
+      helperBlocked |= cpuResources->getGPUCPUs(name, gpu).empty();
+      const auto &reason = cpuResources->getGPUAllocationShortage(name, gpu);
+      if (!reason.empty()) {
+        if (!shortageReasons.empty()) shortageReasons += " ";
+        shortageReasons += "GPU '" + gpu + "': " + reason;
+      }
+    }
+    if (!config.getGPUs().empty() &&
+        (cpuResources->supportsGPUAffinity() || config.getGPUReservedCores()) &&
+        helperBlocked)
+      blockedGPUHelpers->insert(name, !shortageReasons.empty() ? shortageReasons :
+        config.getGPUReservedCores() ?
+        "The reserved Performance 1 cores are currently unavailable. GPU folding is waiting for its helper CPU allocation." :
+        "No unreserved Performance 1 CPUs are available for GPU helpers. Reduce another group's GPU reservation or reserve cores for this group.");
+  }
+  // Per-WU metadata uses the actual core family and scheduled owned pool.
+  // RG-level estimates remain useful before a work unit has been assigned.
+  auto unitAllocations = createDict();
+  if (has("units")) for (unsigned i = 0; i < getUnits()->size(); ++i) {
+    auto unit = getUnits()->getUnit(i);
+    auto allocation = unit->getCPUExecutionInfo();
+    if (allocation.isSet()) unitAllocations->insert(unit->getID(), allocation);
+  }
+  cpuAffinity->insert("unit_allocations", unitAllocations);
+  cpuAffinity->insert("group_allocations", groupAllocations);
+  cpuAffinity->insert("gpu_helper_blocked_groups", blockedGPUHelpers);
+  auto cpuLevels = createList();
+  auto &raw = cpuResources->getRawPerformanceLevels();
+  auto &effective = cpuResources->getPerformanceLevels();
+  for (unsigned i = 0; i < raw.size(); i++) {
+    auto item = createDict();
+    item->insert("logical_cpus", (uint32_t)raw[i].size());
+    item->insert("available_logical_cpus",
+      (uint32_t)(i < effective.size() ? effective[i].size() : 0));
+    item->insert("physical_cpus", physicalCount(
+      i < effective.size() ? effective[i] : CPUResources::CPUSet()));
+    cpuLevels->append(item);
+  }
+  cpuAffinity->insert("performance_levels", cpuLevels);
+  d->insert("cpu_affinity", cpuAffinity);
 }
 
 
@@ -570,18 +707,64 @@ void App::setup() {
 
   // Initialize
   upgradeDB();
+  cpuResources = new CPUResources();
   loadConfig();
   insert("groups", new Groups(*this));
   insert("units", new Units(*this));
+  getGroups()->triggerUpdate();
+
+  // Periodic reconciliation catches topology changes without frequent probing.
+  // Configuration validation also refreshes topology before applying CPU policy.
+  const unsigned topologyRefreshInterval = 300;
+  LOG_INFO(3, "CPU topology watcher enabled: interval="
+    << topologyRefreshInterval << "s");
+  cpuRefreshEvent = base.newEvent([this, topologyRefreshInterval] {
+    // Re-arm before fallible work. Event::call logs callback exceptions, but
+    // cannot otherwise restart this one-shot watcher after a transient failure.
+    cpuRefreshEvent->add(topologyRefreshInterval);
+    bool changed = cpuResources->refreshTopology("periodic");
+    LOG_DEBUG(2, "CPU topology periodic refresh complete: changed=" << changed
+      << " generation=" << cpuResources->getTopologyGeneration());
+    if (changed) getGroups()->triggerUpdate();
+  }, 0);
+  cpuRefreshEvent->add(topologyRefreshInterval);
+}
+
+
+void App::beginGroupConfigNotifications() {
+  ++groupConfigNotificationsDeferred;
+}
+
+
+void App::endGroupConfigNotifications(bool publish) {
+  if (!groupConfigNotificationsDeferred) return;
+  if (--groupConfigNotificationsDeferred) return;
+  if (!publish || remotes.empty() || shouldQuit()) return;
+
+  // Existing connected clients accept path updates, not a second initial
+  // root object. Send deep-copied final trees through the existing protocol.
+  // Each tree is committed/restored state; there is no cross-message atomicity.
+  try {
+    auto snapshot = SmartPtr(new JSON::Dict);
+    for (auto key: {"config", "groups", "units", "info"})
+      if (has(key)) snapshot->insert(key, get(key)->copy(true));
+    for (auto key: {"config", "groups", "units", "info"}) {
+      if (!snapshot->has(key)) continue;
+      auto changes = SmartPtr(new JSON::List);
+      changes->append(key);
+      changes->append(snapshot->get(key));
+      for (auto &remote: remotes)
+        TRY_CATCH_ERROR(remote->sendChanges(changes));
+    }
+  } CATCH_ERROR;
 }
 
 
 void App::notify(const list<JSON::ValuePtr> &change) {
-  if (remotes.empty() || shouldQuit()) return; // Avoid many calls during init
-
   // Automatically save changes to config
   bool isConfig = 2 < change.size() && change.front()->getString() == "config";
   if (isConfig) saveEvent->activate();
+  if (groupConfigNotificationsDeferred || remotes.empty() || shouldQuit()) return;
 
   auto changes = SmartPtr(new JSON::List(change.begin(), change.end()));
   LOG_DEBUG(5, __func__ << ' ' << *changes);
