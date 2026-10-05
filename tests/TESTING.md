@@ -73,3 +73,48 @@ In approximate priority order:
   frontend sees).
 - `Account.cpp` — the account-bridge state machine, the part of the
   client most likely to surprise you.
+
+## CPU affinity regression targets
+
+From `tests`, `scons test` also runs scheduling, SQLite transaction and synthetic allocator regression suites. `scons affinity-fast` runs only these suites. `scons affinity-integration` runs real OS strict-launch checks. Run in a configured compiler environment with CBANG_HOME set. The obsolete adaptive-worker suite has been removed.
+
+Execution-plan and allocator tests link the shipped CPUExecutionPlan.cpp.
+The API smoke test uses disposable paused data and verifies that the removed
+pin_to_perf_cores setting is ignored on database load and API configuration.
+
+
+### Affinity coverage and hardware checks
+
+The execution-policy test exhausts 151,104 small partition cases with three
+competing groups, core widths 1/2/3/6, rotated physical-core order, an excluded
+whole core, and both spare-pool modes. It checks available-CPU membership,
+disjoint logical ownership, whole-core atomicity, zero-demand groups, worker
+budget bounded by pool capacity, and a8/a9 versus ordinary process masks.
+It intentionally does not require optimal capacity from the greedy repair.
+
+`strict-affinity/linux-native.py` also changes the mask of its own isolated
+Linux child, checks the live mask, waits for termination, and verifies an exact
+relaunch. The live shrink check explicitly skips on a single-CPU environment.
+It does not change host cgroups or physical topology, and is not a replacement
+for hot-plug integration. Scheduling/allocator topology fixtures remain synthetic.
+
+Before release, record OS, CPU model, topology, masks and logs for these real
+hardware cases on both a hybrid machine and a homogeneous SMT machine:
+
+- Enable a GPU reservation, then change its size while a GPU WU is running.
+  Confirm graceful restart and that conflicting CPU/GPU launches wait until
+  the old live process exits. CPU work must exclude every reserved sibling.
+- Make a saved positive reservation unavailable in a disposable test setup.
+  Confirm an empty desired mask, a published GPU shortage reason, and no shared
+  or unrestricted GPU launch. Check recovery when resources return.
+- On a disposable Linux cpuset/cgroup setup, shrink and restore the allowed CPU
+  set while test work runs. Check periodic/configuration-triggered discovery,
+  saved-intent preservation and release of old ownership before new launches.
+  On Windows, exercise the corresponding supported process/topology restriction
+  and explicit rejection of masks outside the representable processor group.
+- Leave an assignment pending/retrying while changing another group's resources.
+  Existing WUs must reconcile; the pending assignment must not create another
+  assignment or prevent release of CPUs needed by another group.
+
+WSL passing these suites establishes Linux compilation and syscall-path checks,
+not physical Intel hybrid/big.LITTLE coverage or a real cgroup hot-plug result.

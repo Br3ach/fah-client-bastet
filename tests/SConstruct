@@ -3,6 +3,7 @@
 # orchestration.  See tests/TESTING.md.
 
 import os
+import sys
 
 env = Environment(ENV = os.environ)
 
@@ -45,3 +46,34 @@ Depends(test, tests)
 
 Default(tests)
 Clean(tests, test)
+
+# Affinity regression runners compile the shipped code in isolated workspaces.
+# Run with `scons test`; real OS enforcement checks are opt-in integration.
+def affinity_action(target, source, env):
+    import subprocess
+    root = Dir('#').abspath
+    cbang = os.environ['CBANG_HOME']
+    commands = [
+        [sys.executable, root + '/cpu-affinity-scheduling/run.py'],
+        [sys.executable, root + '/cpu-affinity-transaction/run.py', '--cbang', cbang],
+    ]
+    allocator = root + '/cpu-affinity-synthetic-allocator/run.' + ('cmd' if os.name == 'nt' else 'sh')
+    commands.append(['cmd', '/c', allocator] if os.name == 'nt' else ['sh', allocator])
+    for command in commands:
+        subprocess.run(command, check=True)
+    return 0
+
+fastAffinity = env.Alias('affinity-fast', [], affinity_action)
+env.AlwaysBuild(fastAffinity)
+Depends(test, fastAffinity)
+
+def affinity_integration(target, source, env):
+    import subprocess
+    root = Dir('#').abspath
+    cbang = os.environ['CBANG_HOME']
+    runner = '/strict-affinity/run.py' if os.name == 'nt' else '/strict-affinity/linux-native.py'
+    subprocess.run([sys.executable, root + runner, '--cbang', cbang], check=True)
+    return 0
+
+integration = env.Alias('affinity-integration', [], affinity_integration)
+env.AlwaysBuild(integration)
