@@ -250,7 +250,7 @@ void Group::update() {
 
   // Allocate GPUs with minimum CPU requirements
   for (auto unit: units()) {
-    if (UNIT_RUN < unit->getState()) continue;
+    if (unit->isAssigning() || UNIT_RUN < unit->getState()) continue;
 
     auto unitGPUs = unit->getGPUs();
     if (unitGPUs.empty()) continue;
@@ -280,8 +280,9 @@ void Group::update() {
 
   // Allocate extra CPUs to enabled GPU WUs
   for (auto unit: units()) {
-    // GPU WUs that were enabled above
-    if (!enabledWUs.count(unit->getID())) continue;
+    // Preserve offered CPUs until preparation finishes, including download retries.
+    if (unit->getState() != UNIT_RUN ||
+        !enabledWUs.count(unit->getID())) continue;
 
     uint32_t baseCPUs = gpuBaseCPUs[unit->getID()];
     uint32_t maxCPUs = std::max(baseCPUs, unit->getMaxCPUs());

@@ -27,6 +27,7 @@ struct Unit {
  bool paused=false,managed=true;set<unsigned> pool={0,1,2,3};set<string> gpus;
  Unit()=default;Unit(App&,const string&,unsigned,unsigned,const set<string>&){}
  string getID()const{return id;}UnitState getState()const{return state;}
+ bool isAssigning()const{return state==UNIT_ASSIGN;}
  bool hasGPUs()const{return !gpus.empty();}auto getGPUs()const{return gpus;}
  unsigned getMinCPUs()const{return minimum;}unsigned getMaxCPUs()const{return maximum;}
  unsigned getCPUs()const{return cpus;}void setCPUs(unsigned n){cpus=n;}

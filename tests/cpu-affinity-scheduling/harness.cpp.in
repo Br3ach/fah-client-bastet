@@ -11,7 +11,7 @@
 #define THROW(expr) throw runtime_error("Rejected pin policy")
 using namespace std;
 #define LOG_DEBUG(a,b) do{}while(false)
-const int UNIT_RUN=4;
+const int UNIT_ASSIGN=0,UNIT_DOWNLOAD=1,UNIT_CORE=2,UNIT_RUN=4;
 struct Process {bool live=false;bool isSet()const{return live;}};
 struct RG {string name;string getName()const{return name;}};
 class Unit {public:
@@ -23,7 +23,19 @@ class Unit {public:
  bool desiredAffinityManaged()const{return affinityManaged;}
  set<unsigned> getDesiredAffinity()const{return affinityCPUs;}
  set<unsigned> getDesiredResourceCPUs()const{return affinityCPUs;}
- int getState()const{return UNIT_RUN;}set<string> getGPUs()const{return gpu?set<string>{id}:set<string>{};}
+ int state=UNIT_RUN;bool isAssigning()const{return state==UNIT_ASSIGN;}
+ void setState(int n){state=n;}
+ struct Data {void release(){}} data;
+ void resetDownload(){
+// DOWNLOAD_REASSIGNMENT_IMPLEMENTATION
+ }
+ unsigned getCPUs()const{return cpus;}
+ unsigned requestCPUs()const {
+  struct Sink {unsigned cpus=999;void insert(const string&,unsigned n){cpus=n;}} sink;
+// REQUEST_CPU_IMPLEMENTATION
+  return sink.cpus;
+ }
+ int getState()const{return state;}set<string> getGPUs()const{return gpu?set<string>{id}:set<string>{};}
  unsigned getMinCPUs()const{return minCPU;}unsigned getMaxCPUs()const{return maxCPU;}string getID()const{return id;}
  void setCPUs(unsigned v){cpus=v;}
 };
@@ -33,10 +45,23 @@ struct GroupHarness {
  unsigned schedule(bool managed,unsigned remainingCPUs,set<string> remainingGPUs){
  set<string> enabledWUs;map<string,uint32_t> gpuBaseCPUs;
 // GPU_SCHEDULING_IMPLEMENTATION
- for(auto u:wus)assert(enabledWUs.count(u->id));return remainingCPUs;
+ for(auto u:wus)assert(enabledWUs.count(u->id)==!u->isAssigning());return remainingCPUs;
  }
 };
 int main(){
+ for(bool managed:{false,true}) {
+  GroupHarness g;auto pending=make_shared<Unit>();pending->gpu=true;
+  pending->state=UNIT_ASSIGN;pending->cpus=pending->minCPU=pending->maxCPU=0;
+  g.wus={pending};
+  for(int n=0;n<3;++n){g.schedule(managed,0,{"gpu"});assert(pending->requestCPUs()==0);}
+  pending->state=UNIT_DOWNLOAD;g.schedule(managed,0,{"gpu"});assert(pending->requestCPUs()==0);
+  pending->resetDownload();assert(pending->isAssigning());
+  g.schedule(managed,0,{"gpu"});assert(pending->requestCPUs()==0);
+  pending->state=UNIT_CORE;g.schedule(managed,0,{"gpu"});assert(pending->requestCPUs()==0);
+  pending->state=UNIT_RUN;g.schedule(managed,0,{"gpu"});assert(pending->cpus==(managed?1u:0u));
+ }
+ cout<<"PASS: GPU-only offers survive scheduling and production download-503 reset without helper CPU contamination\n";
+
  Unit next,old;next.affinityManaged=true;next.affinityCPUs={2,3};old.process.live=true;old.runningAffinityManaged=true;old.runningResourceCPUs={1,2};
  assert(next.blocksCPULaunch(old)); // old live mask, independent of desired policy
  old.affinityCPUs={4,5};assert(next.blocksCPULaunch(old));
