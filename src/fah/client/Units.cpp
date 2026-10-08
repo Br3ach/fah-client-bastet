@@ -63,7 +63,7 @@ Units::Units(App &app) {
 
 bool Units::isActive() const {
   for (unsigned i = 0; i < size(); i++)
-    if (!getUnit(i)->isPaused()) return true;
+    if (getUnit(i)->isActive()) return true;
 
   return false;
 }
@@ -71,7 +71,7 @@ bool Units::isActive() const {
 
 bool Units::hasFailure() const {
   for (unsigned i = 0; i < size(); i++)
-    if (getUnit(i)->getRetries()) return true;
+    if (getUnit(i)->getRetries() || getUnit(i)->hasLaunchFailure()) return true;
 
   return false;
 }

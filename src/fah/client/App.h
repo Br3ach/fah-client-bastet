@@ -60,6 +60,7 @@ namespace FAH {
     class OS;
     class Remote;
     class LogTracker;
+    class CPUResources;
 
     class App :
       public cb::Application,
@@ -84,6 +85,19 @@ namespace FAH {
       cb::SmartPointer<Cores>        cores;
       cb::SmartPointer<OS>           os;
       cb::SmartPointer<LogTracker>   logTracker;
+      cb::SmartPointer<CPUResources> cpuResources;
+
+      cb::Event::EventPtr cpuRefreshEvent, cpuReconciliationEvent;
+      unsigned cpuReconciliationRetries = 0;
+
+      // Remains pending after failure until reconciliation succeeds.
+      bool topologyReconciliationPending = false;
+
+      // Nesting depth for deferred remote publication.
+      unsigned groupConfigNotificationsDeferred = 0;
+
+      // Defer reconciliation until group and global configuration are applied.
+      bool groupReconciliationDeferred = false;
 
       std::list<cb::SmartPointer<Remote>> remotes;
 
@@ -103,6 +117,7 @@ namespace FAH {
       cb::HTTP::Client &getClient()    {return client;}
       cb::KeyPair      &getKey()       {return key;}
 
+      cb::DB::Database &getDatabase() {return db;}
       cb::DB::NameValueTable &getDB(
         const std::string name, bool ordered = false);
 
@@ -112,6 +127,15 @@ namespace FAH {
       Cores            &getCores()      {return *cores;}
       OS               &getOS()         {return *os;}
       LogTracker       &getLogTracker() {return *logTracker;}
+      CPUResources     &getCPUResources() {return *cpuResources;}
+      const CPUResources &getCPUResources() const {return *cpuResources;}
+
+      void updateCPUInfo();
+      bool isGroupReconciliationDeferred() const {return groupReconciliationDeferred;}
+      // Nested batches defer remote notifications, not persistence.
+      // Only the outermost end can publish the final observable trees.
+      void beginGroupConfigNotifications();
+      void endGroupConfigNotifications(bool publish);
 
       cb::SmartPointer<Groups> getGroups() const;
       cb::SmartPointer<Config> getConfig() const;
@@ -127,6 +151,7 @@ namespace FAH {
       void remove(Remote &remote);
 
       void triggerUpdate();
+      void reconcileSavedConfiguration() noexcept;
       bool isActive() const;
       bool hasFailure() const;
       void setState(const cb::JSON::Value &msg);

@@ -31,6 +31,7 @@
 #include "Units.h"
 
 #include <functional>
+#include <set>
 
 
 namespace FAH {
@@ -47,6 +48,8 @@ namespace FAH {
       uint32_t lostWUs    = 0;
       uint32_t failures   = 0;
       uint64_t waitUntil  = 0;
+      // Last demand reconciled successfully by this group's polling path.
+      bool lastResourceDemand = true;
 
       std::function<void ()> shutdownCB;
 
@@ -89,16 +92,20 @@ namespace FAH {
 
       const std::string &getName() const {return name;}
       Config &getConfig() const {return *config;}
+      // Used by Groups for staged application/rollback; does not validate or persist.
+      void replaceConfig(const cb::SmartPointer<Config> &next);
       Units units() const;
 
       void setState(const cb::JSON::Value &msg);
 
+      // Runtime eligibility is separate from persistent resource entitlement.
+      bool wantsResources() const;
+      bool waitForRetry() const;
       bool waitForIdle() const;
       bool waitOnBattery() const;
       bool waitOnGPU() const;
       bool keepAwake() const;
       bool isActive() const;
-      bool isAssigning() const;
       void triggerUpdate();
       void shutdown(std::function<void ()> cb);
       void clearErrors();
@@ -109,6 +116,12 @@ namespace FAH {
 
       // From cb::JSON::Value
       void notify(const std::list<cb::JSON::ValuePtr> &change) override;
+
+    private:
+      // Acquisition follows allocation/application and uses their captured results.
+      void updateAssignmentOffer(unsigned remainingCPUs,
+        std::set<std::string> remainingGPUs,
+        const std::set<std::string> &enabledWUs, unsigned wuCount);
 
     protected:
       void update();

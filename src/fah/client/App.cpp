@@ -27,6 +27,8 @@
 \******************************************************************************/
 
 #include "App.h"
+#include "CPUStatusBuilder.h"
+#include "CPUStatusJSON.h"
 #include "Server.h"
 #include "Account.h"
 #include "GPUResources.h"
@@ -37,6 +39,7 @@
 #include "OS.h"
 #include "Remote.h"
 #include "LogTracker.h"
+#include "CPUResources.h"
 
 #include <cbang/Catch.h>
 #include <cbang/Info.h>
@@ -66,6 +69,7 @@
 #include <cbang/config/MinMaxConstraint.h>
 #include <cbang/config/RegexConstraint.h>
 
+#include <iterator>
 #include <set>
 #include <csignal>
 
@@ -257,6 +261,19 @@ SmartPointer<Units> App::getUnits() const {
 void App::configure(const JSON::Value &msg) {
   if (!validateChange(msg)) return;
 
+  beginGroupConfigNotifications();
+  groupReconciliationDeferred = true;
+  struct ConfigurationGuard {
+    App &app;
+    bool &deferred;
+    ~ConfigurationGuard() {
+      if (deferred) {
+        deferred = false;
+        app.reconcileSavedConfiguration();
+      }
+      TRY_CATCH_ERROR(app.endGroupConfigNotifications(true));
+    }
+  } guard{*this, groupReconciliationDeferred};
   if (msg.hasDict("config")) {
     auto config = msg.get("config");
 
@@ -266,7 +283,10 @@ void App::configure(const JSON::Value &msg) {
     getConfig()->configure(*config);
   }
 
-  triggerUpdate();
+  // Reconcile once with both final policies. The guard also reconciles on
+  // failure and guarantees publication; committed settings are not rejected.
+  groupReconciliationDeferred = false;
+  reconcileSavedConfiguration();
 }
 
 
@@ -287,6 +307,54 @@ void App::remove(Remote &remote) {
 
 
 void App::triggerUpdate() {getGroups()->triggerUpdate();}
+
+
+void App::reconcileSavedConfiguration() noexcept {
+  if (groupReconciliationDeferred) return;
+
+  topologyReconciliationPending = true;
+  try {
+    triggerUpdate();
+    topologyReconciliationPending = false;
+    cpuReconciliationRetries = 0;
+    if (cpuReconciliationEvent.get()) cpuReconciliationEvent->del();
+
+  } catch (...) {
+    // Reconcile current saved policy after acceptance or rejection.
+    // Short retries are bounded; the periodic watcher remains the safety net.
+    constexpr unsigned retryDelays[] = {5, 15, 30};
+
+    try {
+      try {
+        if (!cpuReconciliationEvent.get())
+          cpuReconciliationEvent = base.newEvent([this] {
+            ++cpuReconciliationRetries;
+            reconcileSavedConfiguration();
+          }, 0);
+
+        if (cpuReconciliationRetries < std::size(retryDelays) &&
+            !cpuReconciliationEvent->isPending())
+          cpuReconciliationEvent->add(
+            retryDelays[cpuReconciliationRetries]);
+
+      } CBANG_CATCH_ALL(CBANG_LOG_ERROR_LEVEL,
+        " while scheduling CPU reconciliation retry")
+    } catch (...) {
+      // Logging must not escape noexcept.
+    }
+
+    // Report the original failure, including when retry scheduling also failed.
+    try {
+      try {throw;}
+      CBANG_CATCH_ALL(CBANG_LOG_WARNING_LEVEL,
+        " during CPU reconciliation; reconciliation remains pending")
+    } catch (...) {
+      // Logging must not escape noexcept.
+    }
+  }
+}
+
+
 bool App::isActive()   const {return getUnits()->isActive();}
 bool App::hasFailure() const {return getUnits()->hasFailure();}
 
@@ -439,6 +507,8 @@ void App::loadConfig() {
   d->insert("pid",         SystemUtilities::getPID());
   d->insert("cwd",         SystemUtilities::getcwd());
 
+  updateCPUInfo();
+
   Info &info = Info::instance();
   d->insert("mode",               info.get(getName(), "Mode"));
   d->insert("revision",           info.get(getName(), "Revision"));
@@ -482,6 +552,15 @@ void App::loadConfig() {
   if (db.has("config")) config->load(*db.getJSON("config"));
 
   insert("config", config);
+}
+
+
+void App::updateCPUInfo() {
+  if (!hasDict("info")) return;
+  const auto snapshot = CPUStatusBuilder::build(*cpuResources,
+    has("groups") ? getGroups().get() : nullptr,
+    has("units") ? getUnits().get() : nullptr);
+  get("info")->insert("cpu_affinity", serializeCPUStatus(snapshot, *this));
 }
 
 
@@ -570,18 +649,70 @@ void App::setup() {
 
   // Initialize
   upgradeDB();
+  cpuResources = new CPUResources();
   loadConfig();
   insert("groups", new Groups(*this));
   insert("units", new Units(*this));
+  getGroups()->triggerUpdate();
+
+  // Periodic reconciliation catches topology changes without frequent probing.
+  // Configuration validation also refreshes topology before applying CPU policy.
+  const unsigned topologyRefreshInterval = 300;
+  LOG_INFO(3, "CPU topology watcher enabled: interval="
+    << topologyRefreshInterval << "s");
+  cpuRefreshEvent = base.newEvent([this, topologyRefreshInterval] {
+    // Re-arm before fallible work. Event::call logs callback exceptions, but
+    // cannot otherwise restart this one-shot watcher after a transient failure.
+    cpuRefreshEvent->add(topologyRefreshInterval);
+    bool changed = cpuResources->refreshTopology("periodic");
+    topologyReconciliationPending |= changed;
+    LOG_DEBUG(2, "CPU topology periodic refresh complete: changed=" << changed
+      << " generation=" << cpuResources->getTopologyGeneration());
+    // A published topology is not fully reconciled until allocation succeeds.
+    // Keep retrying after a failure even if later probes report no change.
+    if (topologyReconciliationPending)
+      reconcileSavedConfiguration();
+  }, 0);
+  cpuRefreshEvent->add(topologyRefreshInterval);
+}
+
+
+void App::beginGroupConfigNotifications() {
+  ++groupConfigNotificationsDeferred;
+}
+
+
+void App::endGroupConfigNotifications(bool publish) {
+  if (!groupConfigNotificationsDeferred) return;
+  if (--groupConfigNotificationsDeferred) return;
+  if (!publish || remotes.empty() || shouldQuit()) return;
+
+  // Existing connected clients accept path updates, not a second initial
+  // root object. Send deep-copied final trees through the existing protocol.
+  // Each tree is committed/restored state; there is no cross-message atomicity.
+  try {
+    auto snapshot = SmartPtr(new JSON::Dict);
+    for (auto key: {"config", "groups", "units", "info"})
+      if (has(key)) snapshot->insert(key, get(key)->copy(true));
+    for (auto key: {"config", "groups", "units", "info"}) {
+      if (!snapshot->has(key)) continue;
+      auto changes = SmartPtr(new JSON::List);
+      changes->append(key);
+      changes->append(snapshot->get(key));
+      // Sending can synchronously remove a remote from the live list.
+      const auto recipients = remotes;
+      for (const auto &remote: recipients)
+        TRY_CATCH_ERROR(remote->sendChanges(changes));
+    }
+  } CATCH_ERROR;
 }
 
 
 void App::notify(const list<JSON::ValuePtr> &change) {
-  if (remotes.empty() || shouldQuit()) return; // Avoid many calls during init
-
   // Automatically save changes to config
   bool isConfig = 2 < change.size() && change.front()->getString() == "config";
   if (isConfig) saveEvent->activate();
+  if (groupConfigNotificationsDeferred || remotes.empty() || shouldQuit()) return;
 
   auto changes = SmartPtr(new JSON::List(change.begin(), change.end()));
   LOG_DEBUG(5, __func__ << ' ' << *changes);

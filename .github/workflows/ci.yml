@@ -1,0 +1,219 @@
+# /******************************************************************************\
+#
+#                   This file is part of the Folding@home Client.
+#
+#           The fah-client runs Folding@home protein folding simulations.
+#                     Copyright (c) 2001-2026, foldingathome.org
+#                                All rights reserved.
+#
+#        This program is free software; you can redistribute it and/or modify
+#        it under the terms of the GNU General Public License as published by
+#         the Free Software Foundation; either version 3 of the License, or
+#                        (at your option) any later version.
+#
+#          This program is distributed in the hope that it will be useful,
+#           but WITHOUT ANY WARRANTY; without even the implied warranty of
+#           MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#                    GNU General Public License for more details.
+#
+#      You should have received a copy of the GNU General Public License along
+#      with this program; if not, write to the Free Software Foundation, Inc.,
+#            51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+#                   For information regarding this software email:
+#                                  Joseph Coffland
+#                           joseph@cauldrondevelopment.com
+#
+# \******************************************************************************/
+
+name: CPU affinity CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CBANG_HOME: ${{ github.workspace }}/cbang
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      # Pinned upstream master revision containing the topology refactor.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: CauldronDevelopmentLLC/cbang
+          ref: 8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
+          path: cbang
+          persist-credentials: false
+      - name: Checkout stock compatibility baseline
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: FoldingAtHome/fah-client-bastet
+          ref: 0ea081e0efd500aa1b73f8dcf7c67bc72c0a6673
+          path: stock-client
+          persist-credentials: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install scons
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          scons -C cbang -j2
+          scons -j2
+      - name: Client regression and native affinity integration
+        # cbang intercepts the `test` target and assumes the repository root.
+        # Build ordinary tests, then run their harness explicitly from the root.
+        run: |
+          scons -C tests -j2
+          python "$CBANG_HOME/tests/testHarness" -C tests --no-color
+          scons -C tests affinity-fast affinity-integration
+          python tests/api-configuration-smoke.py --client ./fah-client
+      - name: Stock-client database compatibility
+        run: |
+          scons -C stock-client -j2
+          python tests/stock-class-compatibility.py --client ./stock-client/fah-client --affinity-client ./fah-client
+
+  macos:
+    # Native Apple Silicon build covers shared code and the legacy Darwin path.
+    # Strict affinity integration is intentionally Linux/Windows-only.
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CBANG_HOME: ${{ github.workspace }}/cbang
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: CauldronDevelopmentLLC/cbang
+          ref: 8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
+          path: cbang
+          persist-credentials: false
+      - name: Dependencies
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_HOME=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          python3 -m venv .venv
+          .venv/bin/pip install scons
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Correct pinned cbang macOS count conversion
+        # Temporary until a corrected topology revision can be pinned.
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('cbang/src/cbang/os/SystemInfo.cpp')
+          source = path.read_text()
+          old = 'String(cores.size())'
+          if source.count(old) != 1:
+              raise RuntimeError('Pinned cbang count expression changed; review workaround')
+          path.write_text(source.replace(old, 'String(static_cast<uint64_t>(cores.size()))'))
+          PY
+      - name: Build cbang and client with Apple Clang
+        run: |
+          scons -C cbang -j2 compiler=clang
+          scons -j2 compiler=clang
+          test -x ./fah-client
+          file ./fah-client
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      # cbang defaults to x86 even in a vcvars64 shell. Match every dependency.
+      TARGET_ARCH: amd64
+      CBANG_HOME: ${{ github.workspace }}/cbang
+      OPENSSL_HOME: ${{ github.workspace }}/openssl-install
+      OPENSSL_LIBPATH: ${{ github.workspace }}/openssl-install/lib
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: CauldronDevelopmentLLC/cbang
+          ref: 8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
+          path: cbang
+          persist-credentials: false
+      # Build a static /MT dependency to match cbang and the native launcher test.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: openssl/openssl
+          ref: c1eeb9406b6142148f267594197d853403d10208 # OpenSSL 3.5.4
+          path: openssl-source
+          persist-credentials: false
+      - name: Python dependencies
+        run: python -m pip install scons
+      - name: Build OpenSSL with MSVC x64
+        working-directory: openssl-source
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          set "PATH=C:\Strawberry\perl\bin;%PATH%"
+          perl Configure VC-WIN64A no-shared no-asm no-tests --prefix="%OPENSSL_HOME%" --libdir=lib
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
+          nmake install_sw
+          if errorlevel 1 exit /b 1
+      - name: Checkout stock compatibility baseline
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: FoldingAtHome/fah-client-bastet
+          ref: 0ea081e0efd500aa1b73f8dcf7c67bc72c0a6673
+          path: stock-client
+          persist-credentials: false
+      - name: Build cbang and client with MSVC x64
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          python -m SCons -C cbang -j2
+          if errorlevel 1 exit /b 1
+          dumpbin /headers cbang\lib\sqlite3.lib | findstr /C:"machine"
+          if errorlevel 1 exit /b 1
+          python -m SCons -j2
+          if errorlevel 1 exit /b 1
+      - name: Client regression tests
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          rem Avoid cbang's `test` target, which would enter tests/tests.
+          python -m SCons -C tests -j2
+          if errorlevel 1 exit /b 1
+          python "%CBANG_HOME%\tests\testHarness" -C tests --no-color
+          if errorlevel 1 exit /b 1
+          python -m SCons -C tests affinity-fast
+          if errorlevel 1 exit /b 1
+      - name: Native Windows strict launcher integration
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          python -m SCons -C tests affinity-integration
+          if errorlevel 1 exit /b 1
+      - name: Real client configuration and restart integration
+        run: |
+          python tests/api-configuration-smoke.py --client fah-client.exe
+          if errorlevel 1 exit /b 1
+      - name: Stock-client database compatibility
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          python -m SCons -C stock-client -j2
+          if errorlevel 1 exit /b 1
+          python tests/stock-class-compatibility.py --client stock-client\fah-client.exe --affinity-client fah-client.exe
+          if errorlevel 1 exit /b 1
+      - name: Configure diagnostics on failure
+        if: failure()
+        run: |
+          if exist cbang\config.log type cbang\config.log
+          if exist config.log type config.log

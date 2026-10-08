@@ -30,6 +30,7 @@
 
 #include <cbang/json/Observable.h>
 #include <cbang/config/Options.h>
+#include <vector>
 
 
 namespace FAH {
@@ -45,6 +46,12 @@ namespace FAH {
     public:
       Config(App &app, const cb::JSON::ValuePtr &defaults);
 
+      static void validateCPUCount(const cb::JSON::Value &value);
+      // Checks cpu_mode, cpu_class_counts and gpu_reserved_cores.
+      // Other keys are ignored; aggregate and topology checks belong elsewhere.
+      static void validateCPUSetting(
+        const std::string &key, const cb::JSON::Value &value);
+
       void load(const cb::JSON::Value &config);
       void load(const cb::Options &opts);
 
@@ -54,7 +61,15 @@ namespace FAH {
       bool getOnIdle() const;
       bool getOnBattery() const;
       bool getKeepAwake() const;
-      bool getPinToPerfCores() const;
+      uint32_t getGPUReservedCores() const;
+      std::string getGPUPriority() const {return getString("gpu_priority", "");}
+      std::string getCPUMode() const;
+      bool usesCPUClasses() const;
+      std::vector<uint32_t> getCPUClassCounts() const;
+      // Saved worker intent; class totals saturate at uint32 capacity.
+      // This is not the current runtime allocation.
+      uint32_t getConfiguredCPUTotal() const;
+      std::string getCPUConfigDescription() const;
       void setPaused(bool paused);
       bool getPaused() const;
       bool getFinish() const;
@@ -64,6 +79,7 @@ namespace FAH {
       uint64_t getProjectKey(const std::set<std::string> &gpus) const;
       bool getBeta(const std::set<std::string> &gpus) const;
 
+      // Saved worker intent capped by the machine's logical CPU count.
       uint32_t getCPUs() const;
       std::set<std::string> getGPUs() const;
       bool isGPUEnabled(const std::string &id) const;

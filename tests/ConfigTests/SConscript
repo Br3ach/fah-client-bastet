@@ -1,0 +1,5 @@
+Import('*')
+
+configValidation = env.Program('configValidation', 'configValidation.cpp')
+
+Return('configValidation')

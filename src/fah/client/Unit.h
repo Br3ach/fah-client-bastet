@@ -28,6 +28,13 @@
 
 #pragma once
 
+#include "RunningCPUAllocation.h"
+#include "CPUAllocationSlice.h"
+#include "CPUExecutionPlan.h"
+#include "GPUProcessPriorityMonitor.h"
+#include "CPUStatus.h"
+#include <optional>
+
 #include "UnitState.h"
 
 #include <cbang/json/Observable.h>
@@ -78,8 +85,29 @@ namespace FAH {
       unsigned retries     = 0;
       double   wait        = 0;
       int      cs          = -1;
-      uint32_t runningCPUs = 0;
+      RunningCPUAllocation runningAllocation;
+      std::optional<CPUExecutionPlan::SliceExecution> buildCPUExecutionPlan() const;
+      RunningCPUAllocation buildDesiredAllocation() const;
+      std::vector<std::string> buildCoreArgs(const RunningCPUAllocation &allocation) const;
+      cb::SmartPointer<CoreProcess> createCoreProcess(const RunningCPUAllocation &allocation) const;
+      bool blocksCPULaunch(const Unit &running,
+        const RunningCPUAllocation &desired) const;
+      bool desiredAffinityManaged() const;
+      bool desiredGPUReservation() const;
+      bool affinityManaged = false;
+      uint64_t affinityAllocationGeneration = 0;
+      bool allocationBlockedLogged = false;
+      std::set<unsigned> affinityCPUs;
+      bool affinityClassMode = false;
+      CPUAllocationSlices affinitySlices;
+      // Failed launches have an attempted mask but no live ownership record.
+      std::set<unsigned> attemptedAffinityCPUs;
+      std::set<unsigned> rejectedAffinityCPUs;
+      uint64_t rejectedTopologyGeneration = 0;
+      unsigned affinityRejections = 0;
+      bool affinityRejectionLogged = false;
 
+      GPUProcessPriorityMonitor gpuPriorityMonitor;
       uint64_t processStartTime = 0; // Core process start time
       uint64_t lastSkewTimer    = 0; // For detecting clock skew
       int64_t  clockSkew        = 0; // Due to sleeping or clock changes
@@ -114,14 +142,31 @@ namespace FAH {
       UnitState getState() const;
       bool atRunState() const;
       bool isAssigning() const;
+      void abortPendingAssignment();
+      bool matchesAssignmentOffer(
+        uint32_t cpus, const std::set<std::string> &gpus) const;
       bool isWaiting() const;
       bool isPaused() const;
       void setPause(bool pause);
       const char *getPauseReason() const;
       bool isRunning() const;
+      bool isActive() const;
+      // A RUN unit without a process has a recorded launch rejection.
+      bool hasLaunchFailure() const {
+        return getState() == UNIT_RUN && !isRunning() &&
+          (affinityRejections != 0 || has("launch_environment_warning"));
+      }
 
-      void setCPUs(uint32_t cpus);
-      uint32_t getCPUs() const {return getU32("cpus");}
+      void setScheduledCPUs(uint32_t cpus);
+      // cpus is the owned resource pool, not the final execution mask.
+      // Supplied slices are copied; empty slices block a managed class-mode CPU launch.
+      void setCPUAffinity(bool managed, const std::set<unsigned> &cpus,
+        const CPUAllocationSlices *slices = nullptr, bool classMode = false);
+      // Offer count before assignment; scheduler target afterward.
+      // May differ from runningAllocation.workers until restart completes.
+      // Accepted assignment bounds come from signed assignment data.
+      uint32_t getScheduledCPUs() const {return getU32("cpus");}
+      std::optional<UnitCPUStatus> getDesiredCPUStatus() const;
       uint32_t getMinCPUs() const;
       uint32_t getMaxCPUs() const;
       void setGPUs(const std::set<std::string> &gpus);
@@ -164,6 +209,7 @@ namespace FAH {
       void setProgress(double done, double total, bool wu = false);
       void getCore();
       void run();
+      bool readCoreProgress(uint64_t &done, uint64_t &total);
       void readInfo();
       void readViewerData();
       void readViewerTop();
@@ -172,10 +218,12 @@ namespace FAH {
       void finalizeRun();
       void stopRun();
       void monitorRun();
+      void monitorGPUPriority();
       void clean(const std::string &result);
       void setWait(double delay);
       void retry();
 
+      void resolveAssignmentResources(const cb::JSON::ValuePtr &assign);
       void assignResponse(const cb::JSON::ValuePtr &data);
       void writeProjectRestrictions(cb::JSON::Sink &sink,
                                     const cb::JSON::ValuePtr &project);

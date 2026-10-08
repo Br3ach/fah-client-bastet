@@ -27,6 +27,7 @@
 \******************************************************************************/
 
 #include "Config.h"
+#include "GPUProcessPriority.h"
 #include "App.h"
 #include "GPUResources.h"
 
@@ -35,6 +36,10 @@
 #include <cbang/json/Reader.h>
 #include <cbang/os/SystemInfo.h>
 
+#include <algorithm>
+#include <limits>
+#include <sstream>
+
 using namespace FAH::Client;
 using namespace cb;
 using namespace std;
@@ -42,6 +47,29 @@ using namespace std;
 
 Config::Config(App &app, const JSON::ValuePtr &defaults) :
   app(app), defaults(defaults) {merge(*defaults);}
+
+
+void Config::validateCPUCount(const JSON::Value &value) {
+  if (!value.isInteger() || value.getNumber() < 0 ||
+      value.getNumber() > numeric_limits<uint32_t>::max())
+    THROW("CPU counts must be non-negative 32-bit integers");
+}
+
+
+void Config::validateCPUSetting(
+    const string &key, const JSON::Value &value) {
+  if (key == "cpu_mode") {
+    if (!value.isString()) THROW("CPU mode must be a string");
+    const auto mode = value.getString();
+    if (mode != "count" && mode != "classes")
+      THROW("Invalid CPU mode '" << mode << "'");
+  } else if (key == "cpu_class_counts") {
+    if (!value.isList()) THROW("CPU class counts must be a list");
+    for (auto count: value) validateCPUCount(*count);
+  } else if (key == "gpu_reserved_cores") {
+    validateCPUCount(value);
+  }
+}
 
 
 void Config::load(const JSON::Value &config) {
@@ -87,8 +115,48 @@ bool Config::getOnBattery() const {return getBoolean("on_battery");}
 bool Config::getKeepAwake() const {return getBoolean("keep_awake");}
 
 
-bool Config::getPinToPerfCores() const {
-  return getBoolean("pin_to_perf_cores", false);
+uint32_t Config::getGPUReservedCores() const {
+  return getU32("gpu_reserved_cores", 0);
+}
+
+
+string Config::getCPUMode() const {return getString("cpu_mode", "count");}
+
+
+bool Config::usesCPUClasses() const {return getCPUMode() == "classes";}
+
+
+vector<uint32_t> Config::getCPUClassCounts() const {
+  vector<uint32_t> counts;
+  if (!hasList("cpu_class_counts")) return counts;
+  for (auto value: *get("cpu_class_counts")) counts.push_back(value->getU32());
+  return counts;
+}
+
+
+uint32_t Config::getConfiguredCPUTotal() const {
+  if (!usesCPUClasses()) return getU32("cpus", 0);
+
+  uint64_t total = 0;
+  for (auto count: getCPUClassCounts()) total += count;
+  return (uint32_t)min<uint64_t>(total, numeric_limits<uint32_t>::max());
+}
+
+
+string Config::getCPUConfigDescription() const {
+  ostringstream out;
+  out << "mode=" << getCPUMode()
+      << " cpus=" << getConfiguredCPUTotal();
+  if (usesCPUClasses()) {
+    out << " classes=[";
+    auto counts = getCPUClassCounts();
+    for (unsigned i = 0; i < counts.size(); i++) {
+      if (i) out << ',';
+      out << counts[i];
+    }
+    out << ']';
+  }
+  return out.str();
 }
 
 
@@ -124,7 +192,7 @@ bool Config::getBeta(const std::set<string> &gpus) const {
 
 uint32_t Config::getCPUs() const {
   uint32_t maxCPUs = SystemInfo::instance().getCPUCount();
-  uint32_t cpus    = getU32("cpus");
+  uint32_t cpus    = getConfiguredCPUTotal();
   return maxCPUs < cpus ? maxCPUs : cpus;
 }
 
@@ -166,11 +234,19 @@ JSON::Value::iterator Config::insert(
     return end();
   }
 
+  // Shared field checks also protect DB loading. Aggregate and topology
+  // validation require the complete proposed configuration in Groups.
+  validateCPUSetting(key, *value);
+
   if (defaults->get(key)->getType() != value->getType()) {
     LOG_WARNING("Ignoring config key '" << key << "' with wrong type "
                 << value->getType());
     return end();
   }
 
+  if (key == "gpu_priority" && !GPUProcessPriority::valid(value->getString())) {
+    LOG_WARNING("Ignoring unsupported GPU priority '" << value->getString() << "'");
+    return end();
+  }
   return Super_T::insert(key, value);
 }

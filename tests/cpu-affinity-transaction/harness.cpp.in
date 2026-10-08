@@ -1,0 +1,355 @@
+/******************************************************************************\
+
+                  This file is part of the Folding@home Client.
+
+          The fah-client runs Folding@home protein folding simulations.
+                    Copyright (c) 2001-2026, foldingathome.org
+                               All rights reserved.
+
+       This program is free software; you can redistribute it and/or modify
+       it under the terms of the GNU General Public License as published by
+        the Free Software Foundation; either version 3 of the License, or
+                       (at your option) any later version.
+
+         This program is distributed in the hope that it will be useful,
+          but WITHOUT ANY WARRANTY; without even the implied warranty of
+          MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+                   GNU General Public License for more details.
+
+     You should have received a copy of the GNU General Public License along
+     with this program; if not, write to the Free Software Foundation, Inc.,
+           51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+                  For information regarding this software email:
+                                 Joseph Coffland
+                          joseph@cauldrondevelopment.com
+
+\******************************************************************************/
+
+#include <sqlite3.h>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <cassert>
+#include <iostream>
+#include <iterator>
+#include <list>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
+using namespace std;
+#define LOG_WARNING(expr) do{}while(false)
+#define THROW(expr) do {ostringstream err; err << expr; throw runtime_error(err.str());} while(false)
+#define TRY_CATCH_ERROR(expr) do {try {expr;} catch (const exception &) {}} while(false)
+#define CATCH_ERROR catch (const exception &) {}
+#define CBANG_CATCH_WARNING catch (const exception &) {}
+#define CBANG_CATCH_ALL(level,msg) catch (...) {}
+#define LOG_DEBUG(a,b) do {} while(false)
+#define LOG_ERROR(b) do {} while(false)
+namespace cb {
+template<class T> class SmartPointer {
+  template<class U> friend class SmartPointer;
+  shared_ptr<T> p;
+public:
+  SmartPointer()=default;
+  SmartPointer(T *v):p(v){}
+  SmartPointer(shared_ptr<T> v):p(v){}
+  template<class U, class=enable_if_t<is_convertible_v<U*,T*>>>
+  SmartPointer(const SmartPointer<U> &v):p(v.p){}
+  T *operator->() const {return p.get();}
+  T &operator*() const {return *p;}
+  T *get() const {return p.get();}
+  template<class U> SmartPointer<U> cast() const {return dynamic_pointer_cast<U>(p);}
+};
+template<class T> SmartPointer<T> SmartPtr(T *p) {return p;}
+class Timer {public:
+  static double now(){return chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();}
+  static void sleep(double seconds){this_thread::sleep_for(chrono::duration<double>(seconds));}
+};
+namespace JSON {
+class Value; using ValuePtr=SmartPointer<Value>;
+class Value {
+public:
+  map<string,ValuePtr> fields;
+  string text; unsigned cpus=0;
+  virtual ~Value()=default;
+  vector<string> keys() const {vector<string> r; for(auto &p:fields) r.push_back(p.first); return r;}
+  bool has(const string &name) const {return fields.count(name);}
+  virtual ValuePtr get(const string &name) const {return fields.at(name);}
+  void insert(const string &name,const ValuePtr &v){fields[name]=v;}
+  string getString() const {return text;}
+  virtual ValuePtr copy(bool) const {
+    auto v=SmartPtr(new Value); v->text=text;v->cpus=cpus;
+    for(auto &p:fields)v->fields[p.first]=p.second->copy(true);
+    return v;
+  }
+};
+class Dict:public Value {};
+class Reader {public: static ValuePtr parse(const string &) {return new Value;}};
+class List:public Value {
+public:
+  List()=default;
+  template<class It> List(It,It) {text="INTERMEDIATE";}
+  void append(const char *key){text=key;}
+  void append(const ValuePtr &v){text+=":"+v->text;}
+};
+}
+namespace DB {
+class Database;
+class Transaction {
+  Database *db; double timeout;
+  Transaction(Database *db,double timeout):db(db),timeout(timeout){}
+  void release(){db=nullptr;}
+public:
+  ~Transaction(); void commit(); friend class Database;
+};
+class Database {
+  Transaction *transaction=nullptr;
+public:
+  enum transaction_t {DEFERRED,IMMEDIATE,EXCLUSIVE};
+  sqlite3 *db=nullptr; unsigned rollbacks=0;
+  Database(){assert(sqlite3_open(":memory:",&db)==SQLITE_OK);execute("PRAGMA foreign_keys=ON");}
+  ~Database(){assert(sqlite3_close(db)==SQLITE_OK);}
+  void execute(const string &sql) {
+    char *msg=nullptr;int rc=sqlite3_exec(db,sql.c_str(),nullptr,nullptr,&msg);
+    if(rc!=SQLITE_OK){string e=msg?msg:"SQL error";sqlite3_free(msg);throw runtime_error(e);}
+    if(sql=="ROLLBACK")rollbacks++;
+  }
+  SmartPointer<Transaction> begin(transaction_t type=DEFERRED,double timeout=0);
+  void commit();void rollback();
+  string rows(const string &table) const {
+    sqlite3_stmt *stmt=nullptr;string result;
+    string sql="SELECT name,value FROM "+table+" ORDER BY name";
+    assert(sqlite3_prepare_v2(db,sql.c_str(),-1,&stmt,nullptr)==SQLITE_OK);
+    while(sqlite3_step(stmt)==SQLITE_ROW){
+      result+=string(reinterpret_cast<const char*>(sqlite3_column_text(stmt,0)))+":"+
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt,1))+";";
+    }
+    assert(sqlite3_finalize(stmt)==SQLITE_OK);return result;
+  }
+};
+}
+}
+using namespace cb;
+using namespace cb::DB;
+namespace FAH {namespace Client {
+class App;class Group;class Groups;class Unit;
+struct Resource {string get(const string &) const {return "{}";}} resource0;
+class Config:public JSON::Value {
+public:
+  Config(App &,const JSON::ValuePtr &v){cpus=v->cpus;}
+  void load(const JSON::Value &v){cpus=v.cpus;}
+};
+class Remote {
+public:
+  vector<string> received;
+  void send(const JSON::ValuePtr &v){received.push_back(v->text);}
+  void sendChanges(const JSON::ValuePtr &v){received.push_back(v->text);}
+};
+class Event {public: void activate(){} bool isPending()const{return false;}
+ void add(unsigned){}void del(){} };
+class Base {public: template<class F> SmartPointer<Event> newEvent(F,int){return new Event;} };
+class App {
+public:
+  Base base;SmartPointer<Event> cpuReconciliationEvent;unsigned cpuReconciliationRetries=0;
+  Database db;Groups *groups=nullptr;
+  map<string,SmartPointer<Unit>> units;
+  vector<SmartPointer<Remote>> remotes;
+  SmartPointer<Event> saveEvent=new Event;
+  unsigned groupConfigNotificationsDeferred=0;
+  bool injectCommitFailure=false;unsigned updates=0;
+  bool groupReconciliationDeferred=false,topologyReconciliationPending=false;
+  void triggerUpdate();void reconcileSavedConfiguration() noexcept;
+  Database &getDatabase(){return db;}
+  bool shouldQuit() const{return false;}
+  void beginGroupConfigNotifications();void endGroupConfigNotifications(bool);
+  void notify(const list<JSON::ValuePtr> &);
+  JSON::ValuePtr copy(bool) const;
+  SmartPointer<JSON::List> createList(){return new JSON::List;}
+  JSON::ValuePtr createDict(){return new JSON::Value;}
+  bool has(const string &key) const{return key=="groups" || key=="units" || key=="info";}
+  JSON::ValuePtr get(const string &key) const{return copy(true)->get(key);}
+  void changed(const string &key) {
+    auto v=SmartPtr(new JSON::Value);v->text=key;
+    notify({v,new JSON::Value,new JSON::Value});
+  }
+};
+class Unit {
+  App &app;string id;SmartPointer<Group> group;
+public:
+  Unit(App &app,string id,SmartPointer<Group> group):app(app),id(id),group(group){}
+  string getID() const{return id;}
+  Group &getGroup() const{return *group;}
+  void setGroup(const SmartPointer<Group> &v){group=v;app.changed("units");}
+  bool assigning=false,requestActive=true;unsigned aborts=0;
+  void abortPendingAssignment(){if(!assigning)return;assert(sqlite3_get_autocommit(app.db.db));++aborts;requestActive=false;assigning=false;}
+  void save();
+};
+class Group:public JSON::Value {
+  App &app;string name;SmartPointer<Config> config;
+public:
+  Group(App &app,string name):app(app),name(name),config(new Config(app,new JSON::Value)){}
+  string getName() const{return name;}
+  Config &getConfig() const{return *config;}
+  JSON::ValuePtr get(const string &) const override{return config;}
+  void replaceConfig(const SmartPointer<Config> &v){config=v;app.changed("groups");}
+  vector<SmartPointer<Unit>> units() const;
+  void save(){app.db.execute("INSERT OR REPLACE INTO groups VALUES('"+name+"','"+to_string(config->cpus)+"')");}
+};
+class Groups {
+public:
+  App &app;bool rejectValidation=false;bool failUpdate=false;bool configuring=false;map<string,SmartPointer<Group>> entries;
+  Groups(App &app):app(app){app.groups=this;}
+  vector<string> keys() const {vector<string> r;for(auto &p:entries)r.push_back(p.first);return r;}
+  JSON::ValuePtr get(const string &name) const{return entries.at(name);}
+  Group &getGroup(const string &name) {
+    if(!entries.count(name)){entries[name]=new Group(app,name);entries[name]->save();app.changed("groups");}
+    return *entries.at(name);
+  }
+  void insert(const string &name,const SmartPointer<Group> &g){entries[name]=g;app.changed("groups");}
+  void erase(const string &name){entries.erase(name);app.changed("groups");}
+  void delGroup(const string &name) {
+    auto removed=entries.at(name);auto root=entries.at("");
+    for(auto unit:removed->units())unit->setGroup(root);
+    app.db.execute("DELETE FROM groups WHERE name='"+name+"'");erase(name);
+  }
+  // Projection/validation adapters isolate transaction application in this harness.
+  JSON::ValuePtr proposeConfiguration(const JSON::Value &v) const{return v.copy(true);}
+  void validateCPUConfiguration(const map<string,SmartPointer<Config>> &) const{if(rejectValidation){app.changed("info");throw runtime_error("injected validation rejection");}}
+  void configure(const JSON::Value &);
+  void triggerUpdate(){app.updates++;app.changed("info");if(failUpdate)throw runtime_error("injected update failure");}
+};
+void App::triggerUpdate(){groups->triggerUpdate();}
+vector<SmartPointer<Unit>> Group::units() const {
+  vector<SmartPointer<Unit>> r;
+  for(auto &p:app.units)if(p.second->getGroup().getName()==name)r.push_back(p.second);
+  return r;
+}
+void Unit::save() {
+  app.db.execute("INSERT OR REPLACE INTO units VALUES('"+id+"','"+group->getName()+"')");
+  if(app.injectCommitFailure)
+    app.db.execute("INSERT INTO pending_refs VALUES(99)");
+}
+JSON::ValuePtr App::copy(bool) const {
+  auto v=SmartPtr(new JSON::Value);
+  for(auto &p:groups->entries)v->text+=p.first+":"+to_string(p.second->getConfig().cpus)+";";
+  v->text+="|";
+  for(auto &p:units)v->text+=p.first+":"+p.second->getGroup().getName()+";";
+  for(auto key:{"groups","units","info"}) {
+    auto tree=SmartPtr(new JSON::Value);tree->text=v->text;v->fields[key]=tree;
+  }
+  return v;
+}
+}}
+using namespace FAH::Client;
+// EXTRACTED_IMPLEMENTATIONS
+static JSON::ValuePtr proposal() {
+  auto v=SmartPtr(new JSON::Value);
+  for(auto p:vector<pair<string,unsigned>>{{"",2},{"A",4},{"C",1}}){
+    auto config=SmartPtr(new JSON::Value);config->cpus=p.second;v->fields[p.first]=config;
+  }
+  return v;
+}
+static void scenario(bool commitFailure,bool updateFailure=false,bool pending=false) {
+  App app;Groups groups(app);
+  app.db.execute("CREATE TABLE groups(name PRIMARY KEY,value)");
+  app.db.execute("CREATE TABLE units(name PRIMARY KEY,value)");
+  app.db.execute("CREATE TABLE parents(id PRIMARY KEY)");
+  app.db.execute("CREATE TABLE pending_refs(id REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)");
+  for(auto p:vector<pair<string,unsigned>>{{"",2},{"A",3},{"B",1}}){
+    auto &group=groups.getGroup(p.first);group.getConfig().cpus=p.second;group.save();
+  }
+  auto originalGroup=groups.entries.at("B");
+  auto originalA=groups.entries.at("A");
+  auto originalConfig=originalA->get("config").cast<Config>();
+  app.units["uB"]=new Unit(app,"uB",originalGroup);app.units["uB"]->save();app.units["uB"]->assigning=pending;
+  app.remotes.push_back(new Remote);
+  const string beforeLive=app.copy(true)->text;
+  const string beforeGroups=app.db.rows("groups"),beforeUnits=app.db.rows("units");
+  if(commitFailure)app.injectCommitFailure=true;
+  else app.db.execute("CREATE TRIGGER fail_save BEFORE INSERT ON groups WHEN NEW.name='A' BEGIN SELECT RAISE(ABORT,'injected write failure'); END");
+  auto next=proposal();bool failed=false;
+  groups.rejectValidation=true;
+  try{groups.configure(*next);assert(false);}catch(const exception &){}
+  assert(!app.groupConfigNotificationsDeferred && !groups.configuring);
+  assert(app.remotes[0]->received==vector<string>({"groups:"+beforeLive,"units:"+beforeLive,"info:"+beforeLive}));
+  app.remotes[0]->received.clear();groups.rejectValidation=false;
+  groups.failUpdate=updateFailure;
+  try{groups.configure(*next);}catch(const exception &e){failed=true;assert(string(e.what()).find("injected update failure")==string::npos);}
+  assert(failed);
+  assert(app.units.at("uB")->requestActive&&app.units.at("uB")->aborts==0);
+  assert(app.copy(true)->text==beforeLive);
+  assert(app.db.rows("groups")==beforeGroups && app.db.rows("units")==beforeUnits);
+  assert(groups.entries.at("B").get()==originalGroup.get());
+  assert(groups.entries.at("A").get()==originalA.get());
+  assert(groups.entries.at("A")->get("config").cast<Config>().get()==originalConfig.get());
+  assert(&app.units.at("uB")->getGroup()==originalGroup.get());
+  assert(!groups.entries.count("C"));
+  assert(!groups.configuring && !app.groupConfigNotificationsDeferred);
+  assert(sqlite3_get_autocommit(app.db.db)==1 && app.db.rollbacks==1);
+  // No intermediate config/membership notification can escape, even on failure.
+  assert(app.remotes[0]->received==vector<string>({"groups:"+beforeLive,"units:"+beforeLive,"info:"+beforeLive}));
+  app.remotes[0]->received.clear();
+  if(commitFailure)app.injectCommitFailure=false;
+  else app.db.execute("DROP TRIGGER fail_save");
+  bool updateThrew=false;
+  try{groups.configure(*next);}catch(const exception &e){updateThrew=true;assert(string(e.what())=="injected update failure");}
+  assert(!updateThrew);
+  assert(app.units.at("uB")->aborts==(pending?1u:0u));
+  assert(app.units.at("uB")->requestActive==!pending);
+  assert(app.topologyReconciliationPending==updateFailure);
+  assert(!app.groupConfigNotificationsDeferred && !groups.configuring);
+  assert(!groups.entries.count("B") && groups.entries.count("C"));
+  assert(groups.getGroup("A").getConfig().cpus==4);
+  assert(app.units.at("uB")->getGroup().getName().empty());
+  assert(app.db.rows("groups")==":2;A:4;C:1;");
+  assert(app.db.rows("units")=="uB:;");
+  assert(sqlite3_get_autocommit(app.db.db)==1 && app.db.rollbacks==1);
+  auto afterLive=app.copy(true)->text;
+  assert(app.remotes[0]->received==vector<string>({"groups:"+afterLive,"units:"+afterLive,"info:"+afterLive}));
+  groups.failUpdate=false;app.reconcileSavedConfiguration();
+  assert(!app.topologyReconciliationPending);
+  cout<<(commitFailure?"PASS: deferred SQLite COMMIT failure":"PASS: SQLite write failure")
+      <<", database/live identity/WU restoration, deferred notifications, successful retry\n";
+}
+static void emptyIDPlaceholders() {
+  App app;Groups groups(app);
+  app.db.execute("CREATE TABLE groups(name PRIMARY KEY,value)");
+  app.db.execute("CREATE TABLE units(name PRIMARY KEY,value)");
+  groups.getGroup("");groups.getGroup("A");groups.getGroup("B");groups.getGroup("D");
+  auto b=groups.entries.at("B"),d=groups.entries.at("D");
+  auto first=SmartPointer<Unit>(new Unit(app,"",b));
+  auto second=SmartPointer<Unit>(new Unit(app,"",d));
+  first->assigning=second->assigning=true;
+  app.units["first"]=first;app.units["second"]=second;
+  app.db.execute("CREATE TRIGGER fail_save BEFORE INSERT ON groups WHEN NEW.name='A' BEGIN SELECT RAISE(ABORT,'injected write failure'); END");
+  bool failed=false;try{groups.configure(*proposal());}catch(const exception&){failed=true;}
+  assert(failed&&groups.entries.at("B").get()==b.get()&&groups.entries.at("D").get()==d.get());
+  assert(&first->getGroup()==b.get()&&&second->getGroup()==d.get());
+  assert(first->requestActive&&second->requestActive&&first->aborts==0&&second->aborts==0);
+  app.db.execute("DROP TRIGGER fail_save");
+  groups.configure(*proposal());
+  assert(first->aborts==1&&second->aborts==1&&!first->requestActive&&!second->requestActive);
+  assert(&first->getGroup()==groups.entries.at("").get()&&&second->getGroup()==groups.entries.at("").get());
+  cout<<"PASS: duplicate empty-ID placeholders preserve group identity and requests on rollback; both cancel after commit\n";
+}
+int main(){
+  emptyIDPlaceholders();
+  { App app; Groups groups(app); app.remotes.push_back(new Remote);
+    app.db.execute("CREATE TABLE groups(name PRIMARY KEY,value)");
+    app.db.execute("CREATE TABLE units(name PRIMARY KEY,value)");
+    app.beginGroupConfigNotifications();
+    groups.configure(*proposal());
+    assert(app.groupConfigNotificationsDeferred == 1 && app.remotes[0]->received.empty());
+    app.beginGroupConfigNotifications();
+    app.endGroupConfigNotifications(true);
+    assert(app.groupConfigNotificationsDeferred == 1 && app.remotes[0]->received.empty());
+    app.endGroupConfigNotifications(true);
+    assert(!app.groupConfigNotificationsDeferred && app.remotes[0]->received.size() == 3);
+  }
+  for(bool pending:{false,true}){scenario(false,false,pending);scenario(true,false,pending);scenario(false,true,pending);scenario(true,true,pending);}}

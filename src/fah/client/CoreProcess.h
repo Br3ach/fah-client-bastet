@@ -30,10 +30,52 @@
 
 #include <cbang/os/Subprocess.h>
 
+#include <memory>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 
 namespace FAH {
   namespace Client {
+    class AffinityRejected : public std::runtime_error {
+    public:
+      explicit AffinityRejected(const char *reason =
+        "Required FahCore CPU affinity could not be applied exactly") :
+        std::runtime_error(reason) {}
+    };
+
+    class SchedulingRejected : public std::runtime_error {
+    public:
+      SchedulingRejected() :
+        std::runtime_error("Required FahCore scheduler/nice settings could not be established") {}
+    };
+
+    // Own and operate this object as CoreProcess: cbang's Subprocess lifecycle
+    // methods and destructor are non-virtual and do not dispatch to CoreProcess.
     class CoreProcess : public cb::Subprocess {
+      struct StrictProcess;
+      std::unique_ptr<StrictProcess> strictProcess;
+
+      // Hide cbang's independent best-effort affinity state. Required affinity
+      // must go through the verified launch path below.
+      using cb::Subprocess::setAffinity;
+      using cb::Subprocess::getAffinity;
+
+      std::set<unsigned> requiredAffinity;
+      void execStrict(const std::vector<std::string> &args);
+#ifdef _WIN32
+      void execStrictWindows(
+        const std::vector<std::string> &args, StrictProcess &child);
+#elif defined(__linux__)
+      void execStrictLinux(
+        const std::vector<std::string> &args, StrictProcess &child);
+#endif
+
+      std::string priorityOverride;
+      bool priorityMismatchLogged = false;
+
       const std::string path;
       uint64_t interruptTime  = 0;
       uint64_t lastStop       = 0;
@@ -41,6 +83,17 @@ namespace FAH {
 
     public:
       CoreProcess(const std::string &path);
+      ~CoreProcess();
+
+      // Stores a non-empty launch mask; exec() verifies exact application.
+      // Does not change the affinity of an already-running process.
+      void setRequiredAffinity(const std::set<unsigned> &cpus);
+
+      bool isRunning();
+      uint64_t getPID() const;
+      int wait(bool nonblocking = false);
+      bool kill(bool nonblocking = false);
+      void interrupt();
 
       // True once the core has been asked to stop, until it exits
       bool isStopping() const {return interruptTime;}
@@ -50,6 +103,25 @@ namespace FAH {
 
       void exec(const std::vector<std::string> &args);
       void stop();
+
+      // Values must already be validated by GPUProcessPriority::valid().
+      // Stores the selection; does not itself change a running process.
+      void setPriorityOverride(const std::string &value) {
+        if (priorityOverride != value) priorityMismatchLogged = false;
+        priorityOverride = value;
+      }
+
+      const std::string &getPriorityOverride() const {
+        return priorityOverride;
+      }
+
+      // Windows can apply the stored selection live when apply is true.
+      // Linux only verifies it; live configuration changes require a new launch.
+      // Priority failure is advisory and never weakens required affinity.
+      std::string checkPriorityOverride(bool apply);
+#ifdef _WIN32
+      unsigned long desiredPriorityClass() const;
+#endif
     };
   }
 }

@@ -27,14 +27,18 @@
 \******************************************************************************/
 
 #include "Unit.h"
+#include "CPUOwnershipPolicy.h"
 
 #include "App.h"
 #include "OS.h"
 #include "Server.h"
 #include "GPUResources.h"
+#include "CPUResources.h"
 #include "Groups.h"
+#include "Units.h"
 #include "Core.h"
 #include "CoreProcess.h"
+#include "GPUProcessPriority.h"
 #include "Cores.h"
 #include "Config.h"
 #include "ExitCode.h"
@@ -126,7 +130,7 @@ Unit::Unit(App &app, const string &group, uint64_t wu, uint32_t cpus,
   this->wu = wu;
   setGroup(&app.getGroups()->getGroup(group));
   insert("number", wu);
-  setCPUs(cpus);
+  setScheduledCPUs(cpus);
   setGPUs(gpus);
   setState(UNIT_ASSIGN);
 }
@@ -151,6 +155,12 @@ Unit::Unit(App &app, const JSON::ValuePtr &data) : Unit(app) {
   id = getString("id", "");
   LOG_INFO(3, "Loading work unit " << wu << " with ID " << id);
   if (id.empty()) setState(UNIT_DONE); // Invalid WU
+
+  // Older databases may still contain candidate GPUs during preparation.
+  // Resolve them from the persisted, verified assignment on reload too.
+  if (UNIT_DOWNLOAD <= getState() && getState() <= UNIT_RUN &&
+      this->data.isSet() && this->data->hasDict("assignment"))
+    resolveAssignmentResources(this->data->select("assignment.data"));
 
   // Check that we still have the required core
   if (getState() == UNIT_RUN) setState(UNIT_CORE);
@@ -202,6 +212,8 @@ const char *Unit::getPauseReason() const {
   if (group->waitForIdle())        return "Waiting for idle system";
   if (group->waitOnBattery())      return "Pausing on battery";
   if (group->waitOnGPU())          return "Waiting for GPU detection";
+  if (getState() <= UNIT_RUN && group->waitForRetry())
+    return "Waiting after failed work units";
   if (getBoolean("paused", false)) return "Resources not available";
   if (app.shouldQuit())            return "Shutting down";
   return 0;
@@ -211,22 +223,91 @@ const char *Unit::getPauseReason() const {
 bool Unit::isRunning() const {return process.isSet();}
 
 
-void Unit::setCPUs(uint32_t cpus) {
-  if (!hasU32("cpus") || cpus != getCPUs()) insert("cpus", cpus);
+bool Unit::isActive() const {
+  if (isPaused()) return false;
+  if (isRunning() || getState() != UNIT_RUN) return true;
+  // Transfers remain active, but a rejected launch cannot keep a machine
+  // awake indefinitely without an actual FahCore process.
+  if (hasLaunchFailure() && isWaiting()) return false;
+  const auto desired = buildDesiredAllocation();
+  return !desired.isManaged() || !desired.mask.empty();
+}
+
+
+void Unit::setScheduledCPUs(uint32_t cpus) {
+  if (!hasU32("cpus") || cpus != getScheduledCPUs()) insert("cpus", cpus);
+}
+
+
+void Unit::setCPUAffinity(bool managed, const std::set<unsigned> &cpus,
+    const CPUAllocationSlices *slices, bool classMode) {
+  if (managed != affinityManaged || cpus != affinityCPUs)
+    LOG_DEBUG(1, "Desired CPU affinity changed: old-managed=" << affinityManaged
+      << " old=" << CPUResources::formatCPUs(affinityCPUs)
+      << " new-managed=" << managed
+      << " new=" << CPUResources::formatCPUs(cpus));
+  else
+    LOG_DEBUG(2, "Desired CPU affinity unchanged: managed=" << managed
+      << " cpus=" << CPUResources::formatCPUs(cpus));
+  affinityManaged = managed;
+  affinityCPUs = cpus;
+  affinityClassMode = managed && classMode;
+  affinitySlices = affinityClassMode && slices ? *slices : CPUAllocationSlices{};
+  affinityAllocationGeneration = app.getCPUResources().getAllocationGeneration();
+}
+
+
+std::optional<UnitCPUStatus> Unit::getDesiredCPUStatus() const {
+  // Describe the scheduler's current plan, not an old process still stopping.
+  if (!affinityManaged || hasGPUs() || !atRunState() || isPaused() ||
+      !core.isSet() || affinityCPUs.empty() ||
+      affinityAllocationGeneration != app.getCPUResources().getAllocationGeneration()) return std::nullopt;
+  auto execution = buildCPUExecutionPlan();
+  if (!execution) return std::nullopt;
+  const auto plan = execution->summary();
+  std::vector<CPUClassAllocationStatus> classStatus;
+  if (affinityClassMode) for (unsigned i = 0; i < execution->levels.size(); ++i) {
+    const auto &level = execution->levels[i];
+    CPUClassAllocationStatus status;
+    status.workers = affinitySlices[i].workers;
+    status.logical = level.mask.size();
+    status.physical = min<unsigned>(level.physical, level.mask.size());
+    status.poolLogical = level.logical;
+    status.poolPhysical = level.physical;
+    status.fullSMT = level.fullSMT;
+    classStatus.push_back(status);
+  }
+  UnitCPUStatus status;
+  status.group = group->getName();
+  status.number = getU64("number");
+  status.workers = getScheduledCPUs();
+  status.logical = plan.mask.size();
+  status.physical = execution->maskPhysical();
+  status.poolPhysical = plan.physical;
+  status.poolLogical = plan.logical;
+  status.fullSMT = plan.fullSMT;
+  const auto &policy = getConfig();
+  status.configured = policy.getConfiguredCPUTotal();
+  status.mode = policy.getCPUMode();
+  status.classCounts = policy.getCPUClassCounts();
+  status.allocationSlices = std::move(classStatus);
+  return status;
 }
 
 
 uint32_t Unit::getMinCPUs() const {
-  uint32_t cpus = getCPUs();
-  return data.isSet() ?
-    data->selectU32("assignment.data.min_cpus", cpus) : cpus;
+  if (!data.isSet()) return getScheduledCPUs();
+  // Assignment limits must survive temporary runtime worker reductions.
+  const auto assigned = data->selectU32("assignment.data.cpus", getScheduledCPUs());
+  return data->selectU32("assignment.data.min_cpus", assigned);
 }
 
 
 uint32_t Unit::getMaxCPUs() const {
-  uint32_t cpus = getCPUs();
-  return data.isSet() ?
-    data->selectU32("assignment.data.max_cpus", cpus) : cpus;
+  if (!data.isSet()) return getScheduledCPUs();
+  // Assignment limits must survive temporary runtime worker reductions.
+  const auto assigned = data->selectU32("assignment.data.cpus", getScheduledCPUs());
+  return data->selectU32("assignment.data.max_cpus", assigned);
 }
 
 
@@ -418,6 +499,32 @@ void Unit::save() {
 }
 
 
+bool Unit::matchesAssignmentOffer(
+  uint32_t cpus, const std::set<std::string> &gpus) const {
+  if (!isAssigning()) return false;
+  if (!data.isSet()) return getScheduledCPUs() == cpus && getGPUs() == gpus;
+
+  // Compare the captured offer, not fields that reconciliation may have changed.
+  if (!data->hasDict("resources")) return false;
+  const auto &resources = *data->get("resources");
+  if (!resources.hasDict("cpu")) return false;
+  const auto &cpu = *resources.get("cpu");
+  if (!cpu.hasU32("cpus") || cpu.getU32("cpus") != cpus) return false;
+  std::set<std::string> offeredGPUs;
+  for (const auto &key: resources.keys())
+    if (key != "cpu") offeredGPUs.insert(key);
+  return offeredGPUs == gpus;
+}
+
+
+void Unit::abortPendingAssignment() {
+  if (!isAssigning()) return;
+  triggerNext(1); // Keep cleanup scheduled if a later operation throws.
+  cancelRequest();
+  clean("aborted");
+}
+
+
 void Unit::cancelRequest() {pr.release();}
 
 
@@ -450,7 +557,34 @@ void Unit::next() {
 
       // Only interrupt after minimum run time to give the core time to
       // install it's interrupt handlers.
-      if (isPaused() || getState() != UNIT_RUN || getCPUs() != runningCPUs) {
+      const auto desired = buildDesiredAllocation();
+      // An unchanged process mask may safely relinquish unused ownership or
+      // adopt spare cores, but never claim another still-running process's pool.
+      // A stopping process returns above and retains its frozen allocation.
+      if (CPUOwnershipPolicy::sameExecution(desired, runningAllocation, hasGPUs())) {
+        bool blocked = false;
+        auto units = app.getUnits();
+        for (unsigned i = 0; i < units->size(); ++i) {
+          auto other = units->getUnit(i);
+          if (other.get() != this && blocksCPULaunch(*other, desired)) {blocked = true; break;}
+        }
+        if (!blocked) runningAllocation = desired;
+      }
+      bool affinityChanged = desired.mode != runningAllocation.mode ||
+        desired.mask != runningAllocation.mask;
+      // GPU CPU counts account for helper resources; only CPU cores receive
+      // this count through -np. Affinity changes still restart either type.
+      bool cpuCountChanged = !hasGPUs() && getScheduledCPUs() != runningAllocation.workers;
+      if (isPaused() || getState() != UNIT_RUN || cpuCountChanged ||
+          affinityChanged) {
+        if (cpuCountChanged || affinityChanged)
+          LOG_DEBUG(1, "Restarting FahCore for CPU configuration change:"
+            << " allocation-generation=" << runningAllocation.generation
+            << " cpus=" << runningAllocation.workers << "->" << getScheduledCPUs()
+            << " affinity-managed=" << runningAllocation.isManaged() << "->"
+            << desired.isManaged() << " affinity="
+            << CPUResources::formatCPUs(runningAllocation.mask) << "->"
+            << CPUResources::formatCPUs(desired.mask));
         const unsigned minRuntime = 5;
         auto delta = getRunTimeDelta();
         if (minRuntime <= delta) return stopRun();
@@ -488,6 +622,45 @@ void Unit::next() {
     case UNIT_DUMP:     return dump();
     case UNIT_DONE:     return;
     }
+  } catch (const AffinityRejected &e) {
+    const auto generation = app.getCPUResources().getTopologyGeneration();
+    if (rejectedTopologyGeneration != generation || rejectedAffinityCPUs != attemptedAffinityCPUs)
+      affinityRejections = 0;
+    rejectedTopologyGeneration = generation;
+    rejectedAffinityCPUs = attemptedAffinityCPUs;
+    affinityRejections = std::min(affinityRejections + 1, 7u);
+    const unsigned delay = affinityRejections < 3 ? 5 :
+      std::min(300u, 30u << (affinityRejections - 3));
+    // Arm the retry before notifications or topology recovery can throw.
+    triggerNext(delay);
+    setWait(delay); // Scheduler callbacks observe the same launch cooldown.
+    insert("affinity_failure_reason", std::string(e.what()));
+    insert("affinity_retry_delay", delay);
+    // A stable rejected mask must never silently become an unrestricted launch.
+    // Publish the persistent wait after three attempts and log only milestones.
+    if (affinityRejections >= 3)
+      insert("affinity_warning", "CPU affinity could not be enforced. Folding is waiting to preserve CPU allocations.");
+    else erase("affinity_warning");
+    if (affinityRejections == 1 || affinityRejections == 3 ||
+        (affinityRejections == 7 && !affinityRejectionLogged))
+      LOG_WARNING(e.what() << "; requested CPU mask "
+        << CPUResources::formatCPUs(attemptedAffinityCPUs)
+        << "; folding is waiting to preserve CPU allocations, retry in "
+        << delay << " seconds");
+    affinityRejectionLogged = affinityRejections == 7;
+    TRY_CATCH_ERROR(app.getCPUResources().refreshTopology("affinity-rejected"));
+    TRY_CATCH_ERROR(app.triggerUpdate());
+    // A stable topology can still reject affinity. Avoid spinning or charging
+    // an environmental launch failure to the work unit retry budget.
+    return;
+  } catch (const SchedulingRejected &e) {
+    constexpr unsigned delay = 30;
+    triggerNext(delay);
+    setWait(delay);
+    if (!has("launch_environment_warning"))
+      LOG_WARNING(e.what() << "; folding will retry in " << delay << " seconds");
+    insert("launch_environment_warning", std::string(e.what()));
+    return;
   } CATCH_ERROR;
 
   retry();
@@ -495,6 +668,13 @@ void Unit::next() {
 
 
 void Unit::processStarted(const SmartPointer<CoreProcess> &process) {
+  affinityRejections = 0;
+  affinityRejectionLogged = false;
+  rejectedAffinityCPUs.clear();
+  erase("affinity_warning");
+  erase("affinity_failure_reason");
+  erase("affinity_retry_delay");
+  erase("launch_environment_warning");
   auto pid = process->getPID();
   LOG_INFO(3, "Started FahCore on PID " << pid);
   this->process = process;
@@ -511,6 +691,7 @@ void Unit::processEnded() {
   erase("start_time");
   erase("pid");
   processStartTime = 0;
+  runningAllocation = {}; // Ownership is released only after process cleanup.
 }
 
 
@@ -591,11 +772,9 @@ void Unit::getCore() {
         retry();
 
       } else if (core->isReady()) {
-        // Update resource allocation only after WU is ready to run
+        // Revalidate assigned resources before granting runnable ownership
         auto assign = data->get("assignment")->get("data");
-        setCPUs(assign->getU32("cpus"));
-        if (assign->hasList("gpus")) insert("gpus", assign->get("gpus"));
-        else get("gpus")->clear();
+        resolveAssignmentResources(assign);
 
         setState(UNIT_RUN);
         setPause(true); // Let Group start this WU when appropriate
@@ -607,23 +786,8 @@ void Unit::getCore() {
 }
 
 
-void Unit::run() {
-  if (process.isSet()) return; // Already running
-
-  // Make sure WU data exists
-  if (!SystemUtilities::exists(getDirectory() + "/wudata_01.dat")) {
-    LOG_ERROR("Missing WU data");
-    return clean("missing");
-  }
-
-  // Remove old results if exists
-  SystemUtilities::unlink(getDirectory() + "/wuresults_01.dat");
-
-  // Rotate old log file
-  string logFile = getDirectory() + "/logfile_01.txt";
-  SystemUtilities::rotate(logFile, string(), 32);
-
-  // Args
+vector<string> Unit::buildCoreArgs(const RunningCPUAllocation &allocation) const {
+  // FahCore arguments consume the captured launch allocation.
   vector<string> args;
   args.push_back("-dir");
   args.push_back(getID());
@@ -634,13 +798,23 @@ void Unit::run() {
   args.push_back("-lifeline");
   args.push_back(String(SystemUtilities::getPID()));
 
-  runningCPUs = getCPUs();
-
   auto &gpus = *get("gpus");
   if (gpus.size()) {
+    if (gpus.size() != 1) THROW("FahCore launch requires exactly one assigned GPU");
     string id = gpus.getString(0);
     auto &gpu = *app.getGPUs().get(id).cast<GPUResource>();
 
+#ifdef __linux__
+    const auto priority = getConfig().getGPUPriority();
+    if (!priority.empty() && GPUProcessPriority::supportsCore(core->getType())) {
+      // Verified Core 27/8.2.1 defaults reset nice to 19; Core 28/8.3.1 also
+      // selects SCHED_IDLE. Explicit Low/Normal avoids those default resets
+      // and leaves the launcher's SCHED_OTHER policy intact. These arguments
+      // do not select SCHED_OTHER themselves or grant permission to raise nice.
+      args.push_back("--priority");
+      args.push_back(GPUProcessPriority::coreArgument(priority));
+    }
+#endif
     // GPU UUID
     if (gpu.hasString("uuid")) {
       args.push_back("-gpu-uuid");
@@ -668,26 +842,175 @@ void Unit::run() {
 
   } else { // CPU
     args.push_back("-np");
-    args.push_back(String(runningCPUs));
+    args.push_back(String(allocation.workers));
   }
 
-  // Run
+  return args;
+}
+
+
+SmartPointer<CoreProcess> Unit::createCoreProcess(const RunningCPUAllocation &allocation) const {
   auto process = SmartPtr(new CoreProcess(core->getPath()));
 
-  // Pin to performance cores on hybrid CPUs
-  if (getConfig().getPinToPerfCores()) {
-    auto cpus = SystemInfo::instance().getPerformanceCPUs();
+  if (hasGPUs()) {
+    auto priority = getConfig().getGPUPriority();
+#ifdef __linux__
+    if (!GPUProcessPriority::supportsCore(core->getType())) priority.clear();
+#endif
+    process->setPriorityOverride(priority);
+  }
+  if (allocation.isManaged()) {
+    LOG_INFO(3, "Applying FahCore CPU affinity "
+      << CPUResources::formatCPUs(allocation.mask));
+    process->setRequiredAffinity(allocation.mask);
+  }
 
-    if (cpus.empty()) LOG_INFO(3, "No performance cores detected, not pinning");
-    else if (!gpus.size() && cpus.size() < runningCPUs)
-      LOG_INFO(3, "More CPUs allocated than performance cores, not pinning");
-    else {
-      LOG_INFO(3, "Pinning core to " << cpus.size() << " performance CPUs");
-      process->setAffinity(cpus);
+  return process;
+}
+
+
+bool Unit::desiredGPUReservation() const {
+  return hasGPUs() && getConfig().getGPUReservedCores() != 0;
+}
+
+
+bool Unit::desiredAffinityManaged() const {
+  if (!hasGPUs()) return affinityManaged;
+  return desiredGPUReservation() || app.getCPUResources().supportsGPUAffinity();
+}
+
+
+std::optional<CPUExecutionPlan::SliceExecution> Unit::buildCPUExecutionPlan() const {
+  const auto &cpu = app.getCPUResources();
+  const auto slices = affinityClassMode ? affinitySlices :
+    CPUAllocationSlices{{getScheduledCPUs(), affinityCPUs}};
+  return CPUExecutionPlan::createSlices(
+    core.isSet() ? core->getType() : 0,
+    slices, cpu.getCoreThreads(), cpu.getGroupCPUs(group->getName()));
+}
+
+
+RunningCPUAllocation Unit::buildDesiredAllocation() const {
+  const auto &cpu = app.getCPUResources();
+  RunningCPUAllocation desired;
+  desired.workers = getScheduledCPUs();
+  if (!desiredAffinityManaged()) desired.mode = CPUAllocationMode::Unmanaged;
+  else if (!hasGPUs()) desired.mode = CPUAllocationMode::ManagedCPU;
+  else if (desiredGPUReservation()) desired.mode = CPUAllocationMode::ReservedGPU;
+  else desired.mode = CPUAllocationMode::SharedGPU;
+  desired.generation = cpu.getAllocationGeneration();
+  if (!desired.isManaged()) return desired;
+
+  if (hasGPUs()) {
+    // Candidate or malformed multi-device lists never become launch ownership.
+    const auto gpus = getGPUs();
+    if (gpus.size() != 1) return desired;
+    // Helper counts are accounting metadata, not a minimum mask size.
+    // Shared/reserved helpers may time-share LPs; an empty pool blocks launch.
+    desired.resourcePool = cpu.getGPUCPUs(group->getName(), *gpus.begin());
+    desired.mask = desired.resourcePool;
+  } else {
+    desired.resourcePool = affinityCPUs;
+    auto execution = buildCPUExecutionPlan();
+    if (!execution) return desired; // Managed empty slices never become unrestricted.
+    const auto plan = execution->summary();
+    desired.mask = plan.mask;
+    desired.physical = plan.physical;
+    desired.fullSMT = plan.fullSMT;
+  }
+  return desired;
+}
+
+
+bool Unit::blocksCPULaunch(const Unit &running,
+    const RunningCPUAllocation &desired) const {
+  if (!running.process.isSet()) return false;
+  return CPUOwnershipPolicy::blocksLaunch(desired, hasGPUs(),
+    running.runningAllocation, running.hasGPUs());
+}
+
+
+void Unit::run() {
+  if (process.isSet()) return; // Already running
+
+  // One immutable record drives every decision in this launch attempt. Retry
+  // callbacks rebuild it after waiting, never reuse a previous desired record.
+  const auto desired = buildDesiredAllocation();
+  if (!hasGPUs() && desired.isManaged() &&
+      affinityAllocationGeneration != desired.generation) {
+    app.triggerUpdate(); // Reconcile the scheduler's pool before launching.
+    return triggerNext(1);
+  }
+  if (desired.isManaged() && desired.mask.empty()) {
+    if (hasGPUs() && !allocationBlockedLogged) {
+      LOG_WARNING("GPU folding in RG '" << group->getName()
+        << "' is waiting for helper CPUs; check GPU Performance 1 reservations and current topology");
+      allocationBlockedLogged = true;
+    }
+    LOG_DEBUG(2, "Waiting for a non-empty CPU allocation");
+    return triggerNext(1);
+  }
+  allocationBlockedLogged = false;
+  auto units = app.getUnits();
+  for (unsigned i = 0; i < units->size(); ++i) {
+    auto running = units->getUnit(i);
+    if (running.get() != this && blocksCPULaunch(*running, desired)) {
+      LOG_DEBUG(2, "Waiting for CPU reservation held by WU " << running->getID());
+      return triggerNext(1);
     }
   }
 
+  // Make sure WU data exists
+  if (!SystemUtilities::exists(getDirectory() + "/wudata_01.dat")) {
+    LOG_ERROR("Missing WU data");
+    return clean("missing");
+  }
+
+  // Remove old results if exists
+  SystemUtilities::unlink(getDirectory() + "/wuresults_01.dat");
+
+  // Rotate old log file
+  string logFile = getDirectory() + "/logfile_01.txt";
+  SystemUtilities::rotate(logFile, string(), 32);
+
+  LOG_DEBUG(1, "Launching FahCore: group='" << group->getName()
+    << "' type=" << (hasGPUs() ? "GPU" : "CPU")
+    << " allocation-generation=" << desired.generation
+    << " cpus=" << desired.workers
+    << " affinity-managed=" << desired.isManaged()
+    << " affinity=" << CPUResources::formatCPUs(desired.mask));
+
+  if (hasGPUs()) {
+    insert("gpu_priority_requested", getConfig().getGPUPriority());
+    insert("gpu_priority_applied", "");
+    insert("gpu_priority_warning", "");
+  }
+  uint64_t launchDone = 0, total = 0;
+  bool baselineCaptured = false;
+  if (hasGPUs()) {
+    // Restored checkpoint progress is a baseline, not work by the new process.
+    TRY_CATCH_ERROR(baselineCaptured = readCoreProgress(launchDone, total));
+  }
+  gpuPriorityMonitor.reset(baselineCaptured, launchDone,
+    hasGPUs() ? getConfig().getGPUPriority() : "");
+  const auto args = buildCoreArgs(desired);
+  auto process = createCoreProcess(desired);
+
+  if (!hasGPUs() && desired.isManaged() && desired.fullSMT) {
+    if (!affinityClassMode)
+      LOG_WARNING("Full SMT utilisation may reduce performance: " << desired.workers
+        << " workers use all hardware threads of " << desired.physical
+        << " allocated physical cores. Consider one fewer worker and compare performance.");
+    else
+      LOG_WARNING("Full SMT utilisation may reduce performance in an allocated performance-class pool. "
+        "Consider one fewer worker in that class and compare performance.");
+  }
+
+  attemptedAffinityCPUs = desired.mask;
   process->exec(args);
+  // Publish live ownership only after exec succeeds. Rejection handling retains
+  // the attempted mask separately, without claiming CPUs for a failed launch.
+  runningAllocation = desired;
   processStarted(process);
   startLogCopy(logFile); // Redirect core output to log
   triggerNext();
@@ -698,26 +1021,32 @@ void Unit::run() {
 }
 
 
-void Unit::readInfo() {
+bool Unit::readCoreProgress(uint64_t &done, uint64_t &total) {
   string filename = getDirectory() + "/wuinfo_01.dat";
+  if (!SystemUtilities::exists(filename)) return false;
 
-  if (SystemUtilities::exists(filename)) {
-    struct WUInfo {
-      uint32_t type;
-      uint8_t  reserved[80];
-      uint32_t total;
-      uint32_t done;
-    };
+  struct WUInfo {
+    uint32_t type;
+    uint8_t  reserved[80];
+    uint32_t total;
+    uint32_t done;
+  };
 
-    WUInfo info;
-    auto f = SystemUtilities::iopen(filename);
-    f->read((char *)&info, sizeof(WUInfo));
+  WUInfo info;
+  auto f = SystemUtilities::iopen(filename);
+  f->read((char *)&info, sizeof(WUInfo));
+  if (f->gcount() != sizeof(WUInfo)) return false;
+  if (info.type != core->getType()) THROW("Invalid WU info");
+  if (!info.total || info.total < info.done) return false;
+  done = info.done;
+  total = info.total;
+  return true;
+}
 
-    if (f->gcount() == sizeof(WUInfo)) {
-      if (info.type != core->getType()) THROW("Invalid WU info");
-      updateKnownProgress(info.done, info.total);
-    }
-  }
+
+void Unit::readInfo() {
+  uint64_t done = 0, total = 0;
+  if (readCoreProgress(done, total)) updateKnownProgress(done, total);
 }
 
 
@@ -924,8 +1253,23 @@ void Unit::finalizeRun() {
 
 
 void Unit::stopRun() {
-  process->stop();
+  // Interrupt/kill can throw; keep polling until exit or forced termination.
   triggerNext(1);
+  process->stop();
+}
+
+
+void Unit::monitorGPUPriority() {
+  if (!hasGPUs() || !process.isSet()) return;
+  auto status = gpuPriorityMonitor.update(*process, core->getType(),
+    getConfig().getGPUPriority(), lastKnownDone, lastKnownTotal,
+    getKnownProgress(), Time::now());
+  if (!status) return;
+  insert("gpu_priority_requested", status->requested);
+  insert("gpu_priority_applied", status->applied);
+  if (!status->warning.empty() && status->warning != getString("gpu_priority_warning", ""))
+    LOG_INFO(1, status->warning);
+  insert("gpu_priority_warning", status->warning);
 }
 
 
@@ -936,6 +1280,8 @@ void Unit::monitorRun() {
 
     // Read core shared info file
     readInfo();
+
+    monitorGPUPriority();
 
     // Read visualization data
     readViewerData();
@@ -1049,6 +1395,29 @@ void Unit::retry() {
 }
 
 
+void Unit::resolveAssignmentResources(const JSON::ValuePtr &assign) {
+  // Parse and validate all resources before replacing the candidate set.
+  const auto cpus = assign->getU32("cpus");
+  const auto minimum = assign->getU32("min_cpus", cpus);
+  const auto maximum = assign->getU32("max_cpus", cpus);
+  if (minimum > maximum)
+    THROW("Assignment CPU minimum exceeds maximum");
+  std::set<string> assignedGPUs;
+  if (assign->has("gpus")) {
+    if (!assign->hasList("gpus")) THROW("Assignment GPUs must be a list");
+    const auto &gpus = *assign->get("gpus");
+    if (gpus.size() > 1) THROW("Assignment requires multiple GPUs; FahCore launches support one GPU");
+    if (gpus.size()) {
+      const auto id = gpus.getString(0);
+      if (id.empty() || !getGPUs().count(id)) THROW("Assignment selected an unoffered GPU");
+      assignedGPUs.insert(id);
+    }
+  }
+  setScheduledCPUs(cpus);
+  setGPUs(assignedGPUs);
+}
+
+
 void Unit::assignResponse(const JSON::ValuePtr &data) {
   LOG_INFO(1, "Received WU assignment " << id);
   LOG_DEBUG(3, data->toString());
@@ -1066,6 +1435,9 @@ void Unit::assignResponse(const JSON::ValuePtr &data) {
   if (idFromSig64(request->getString("signature")) != id)
     THROW("WS response does not match request");
 
+  // Release unselected candidates before download/core preparation so another
+  // GPU can receive its own WU without waiting for this core to become ready.
+  resolveAssignmentResources(assign);
   LOG_DEBUG(3, "Received assignment for " << assign->getU32("cpus")
     << " cpus and " << get("gpus")->size() << " gpus");
 
@@ -1120,7 +1492,7 @@ void Unit::writeRequest(JSON::Sink &sink) const {
   // CPU
   sink.insertDict("cpu");
   sink.insert("cpu",            app.selectString("info.cpu"));
-  sink.insert("cpus",           getCPUs());
+  sink.insert("cpus",           getScheduledCPUs());
   sink.insert("vendor",         cpuInfo->getVendor());
   sink.insert("signature",      cpuInfo->getSignature());
   sink.insert("family",         cpuInfo->getFamily());
@@ -1147,7 +1519,7 @@ void Unit::assign() {
   if (pr.isSet()) return; // Already assigning
 
   // Never request an assignment without resources
-  if (!getCPUs() && !hasGPUs()) {
+  if (!getScheduledCPUs() && !hasGPUs()) {
     LOG_WARNING("Refusing WU assignment request with no resources");
     return clean("aborted");
   }
@@ -1304,6 +1676,9 @@ void Unit::dump() {
 
 
 void Unit::response(HTTP::Request &req) {
+  // A cancelled callback must not clear or dispatch a newer active request.
+  if (!pr.isSet() || pr->getRequest().get() != &req) return;
+
   pr.release(); // Deref request object
 
   try {

@@ -1,0 +1,105 @@
+{
+  "capability": "hard",
+  "available": 12,
+  "topology_generation": 7,
+  "allocation_generation": 9,
+  "class_selection": true,
+  "effective_classes": true,
+  "smt_topology": true,
+  "managed": true,
+  "runtime_fallback": true,
+  "runtime_fallback_reason": "saved GPU reservation cannot fit",
+  "gpu_cpu_reservation": true,
+  "allocatable": 10,
+  "physical_cpus": 6,
+  "performance1_core_threads": [
+    2,
+    2
+  ],
+  "performance_levels": [
+    {
+      "logical_cpus": 8,
+      "available_logical_cpus": 6,
+      "physical_cpus": 3
+    },
+    {
+      "logical_cpus": 4,
+      "available_logical_cpus": 4,
+      "physical_cpus": 4
+    }
+  ],
+  "group_allocations": {
+    "CPU": {
+      "logical_cpus": 6,
+      "physical_cpus": 3,
+      "pool_logical_cpus": 6,
+      "pool_physical_cpus": 3,
+      "allocated_workers": 6,
+      "has_smt": true,
+      "potential_full_smt": true,
+      "configured_cpus": 8,
+      "cpu_mode": "classes",
+      "cpu_class_counts": [
+        8,
+        0
+      ],
+      "class_allocations": [
+        {
+          "allocated_workers": 6,
+          "logical_cpus": 6,
+          "physical_cpus": 3,
+          "pool_logical_cpus": 6,
+          "pool_physical_cpus": 3,
+          "potential_full_smt": true
+        },
+        {
+          "allocated_workers": 0,
+          "logical_cpus": 0,
+          "physical_cpus": 0,
+          "pool_logical_cpus": 0,
+          "pool_physical_cpus": 0,
+          "potential_full_smt": false
+        }
+      ]
+    }
+  },
+  "unit_allocations": {
+    "unit-id": {
+      "group": "CPU",
+      "number": 42,
+      "allocated_workers": 6,
+      "logical_cpus": 6,
+      "physical_cpus": 3,
+      "pool_physical_cpus": 3,
+      "pool_logical_cpus": 6,
+      "full_smt": false,
+      "configured_cpus": 8,
+      "cpu_mode": "classes",
+      "cpu_class_counts": [
+        8,
+        0
+      ],
+      "class_allocations": [
+        {
+          "allocated_workers": 6,
+          "logical_cpus": 6,
+          "physical_cpus": 3,
+          "pool_logical_cpus": 6,
+          "pool_physical_cpus": 3,
+          "full_smt": false
+        },
+        {
+          "allocated_workers": 0,
+          "logical_cpus": 0,
+          "physical_cpus": 0,
+          "pool_logical_cpus": 0,
+          "pool_physical_cpus": 0,
+          "full_smt": false
+        }
+      ]
+    }
+  },
+  "gpu_helper_blocked_groups": {
+    "GPU": "no complete helper core"
+  }
+}

@@ -4,6 +4,48 @@ Folding@Home Tester Guide
 The document provides some information on running and testing the new
 foldingathome.org client software code named "bastet".
 
+## Developer regression tests
+
+For the ordinary client suite, CPU-affinity regression suites, native launch
+checks and compatibility tests, see [Developer testing instructions](tests/TESTING.md#cpu-affinity-regression-targets).
+The tester guide below covers installation and manual testing.
+
+## CPU-affinity v6 manual testing
+
+Use matching v6 client and Web Control revisions. Record both revisions, the
+cbang revision, OS, CPU model, enabled GPUs and relevant group settings.
+Use the supplied local Web Control for affinity settings; the hosted interface
+may not expose this branch's options.
+
+Before replacing a client executable, exit the tray application or stop its
+service and wait for FahCore processes to exit. Pausing alone does not stop the
+client. Back up the program and data directories. Keep current folding data
+when rolling back; restoring an old data backup can discard WU progress.
+Follow the specific package's installation instructions.
+
+Check these scenarios against logs, published allocation status and actual
+process affinity/priority where the OS supports inspection:
+
+- General and class CPU groups, including mixed-class WUs and full-SMT advisories.
+- Multiple CPU WUs, minimum-capacity waits and recovery after capacity returns.
+- Shared GPU helpers, exclusive reservations and reservation shortages.
+- Pause/resume, idle/battery waits, Finish, group backoff and group deletion.
+- GPU priority changes during initialization and resumed work. Windows applies
+  overrides live; Linux changes take effect on the next launch and core support
+  determines whether the requested priority is retained.
+- Graceful stop from Windows tray/service contexts, not only terminal consoles.
+- Save/restart persistence and stock-client rollback, which strips v6-only fields.
+
+Synthetic tests do not establish real hybrid topology correctness, performance,
+or every installed service environment. Include logs and reproduction steps in
+reports; remove passkeys, account tokens and other credentials before sharing.
+Detailed policy and limitations are in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Older Bastet installation guide
+
+The following guide describes the original Bastet transition. Its alpha builds
+and hosted Web Control are not the v6 tester package.
+
 ## Install
 
  1. Uninstall the old FAH client.
