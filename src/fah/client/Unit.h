@@ -89,6 +89,14 @@ namespace FAH {
       uint64_t lastKnownProgressUpdate        = 0;
       uint64_t lastKnownProgressUpdateRunTime = 0;
 
+      // Restored checkpoint progress is the baseline, not newly performed work.
+      uint64_t estimateBaselineDone    = 0;
+      uint64_t estimateBaselineRunTime = 0;
+      // Effective time represented by restored progress; zero uses a fresh estimate.
+      double estimateBaselineTime = 0;
+      double resumeProgress = 0;
+      uint64_t lastRuntimeSaveAttempt = 0;
+
       unsigned stalls    = 0; // Consecutive stalls without progress
       uint64_t stallDone = 0; // Progress at the last detected stall
 
@@ -131,6 +139,7 @@ namespace FAH {
 
       uint64_t getRunTimeDelta() const;
       uint64_t getRunTime() const;
+      uint64_t getPerformanceRunTimeEstimate() const;
       uint64_t getRunTimeEstimate() const;
       double   getEstimatedProgress() const;
       uint64_t getCreditEstimate() const;

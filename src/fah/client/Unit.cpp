@@ -271,14 +271,39 @@ uint64_t Unit::getRunTime() const {
 }
 
 
-uint64_t Unit::getRunTimeEstimate() const {
+uint64_t Unit::getPerformanceRunTimeEstimate() const {
   // If valid, use estimate provided by the WS
-  uint64_t estimate = data->selectU64("wu.data.estimate", 0);
+  const uint64_t estimate = data->selectU64("wu.data.estimate", 0);
   if (estimate) return estimate;
 
-  // Make our own estimate
-  if (getKnownProgress() && lastKnownProgressUpdateRunTime)
-    return lastKnownProgressUpdateRunTime / getKnownProgress();
+  if (!lastKnownTotal || lastKnownDone < estimateBaselineDone ||
+      lastKnownProgressUpdateRunTime < estimateBaselineRunTime)
+    return 0;
+
+  const uint64_t elapsed =
+    lastKnownProgressUpdateRunTime - estimateBaselineRunTime;
+
+  double runtime;
+  if (estimateBaselineTime > 0) {
+    if (!lastKnownDone) return 0;
+    runtime = (estimateBaselineTime + elapsed) * lastKnownTotal / lastKnownDone;
+
+  } else {
+    const uint64_t completed = lastKnownDone - estimateBaselineDone;
+    if (!completed || !elapsed) return 0;
+    runtime = (double)elapsed * lastKnownTotal / completed;
+  }
+
+  if (!isfinite(runtime) || runtime < 1 || runtime >= (double)UINT64_MAX)
+    return 0;
+
+  return (uint64_t)runtime;
+}
+
+
+uint64_t Unit::getRunTimeEstimate() const {
+  uint64_t estimate = getPerformanceRunTimeEstimate();
+  if (estimate) return estimate;
 
   // Make a wild guess based on timeout or 1 day
   return 0.2 * data->selectU64("assignment.data.timeout", Time::SEC_PER_DAY);
@@ -330,7 +355,10 @@ uint64_t Unit::getETA() const {
 
 
 uint64_t Unit::getPPD() const {
-  return (double)getCreditEstimate() / getRunTimeEstimate() * Time::SEC_PER_DAY;
+  uint64_t estimate = getPerformanceRunTimeEstimate();
+  if (!estimate) return 0;
+
+  return (double)getCreditEstimate() / estimate * Time::SEC_PER_DAY;
 }
 
 
@@ -406,10 +434,15 @@ void Unit::dumpWU() {
 void Unit::save() {
   if (getState() < UNIT_CORE || getState() == UNIT_DONE) return;
 
-  JSON::BufferWriter writer;
+  // Snapshot ongoing runtime without changing the live accounting baseline.
+  auto state = copy(true);
+  state->insert("run_time", getRunTime());
+  if (lastKnownTotal && !isFinished())
+    state->insert("wu_progress", getKnownProgress());
 
+  JSON::BufferWriter writer;
   writer.beginDict();
-  writer.insert("state", *this);
+  writer.insert("state", *state);
   if (data.isSet()) writer.insert("data", *data);
   writer.endDict();
   writer.flush();
@@ -497,10 +530,17 @@ void Unit::next() {
 void Unit::processStarted(const SmartPointer<CoreProcess> &process) {
   auto pid = process->getPID();
   LOG_INFO(3, "Started FahCore on PID " << pid);
+  resumeProgress = lastKnownTotal ?
+    getKnownProgress() : getNumber("wu_progress", 0);
+  estimateBaselineDone = 0;
+  estimateBaselineRunTime = 0;
+  estimateBaselineTime = 0;
+
   this->process = process;
   lastSkewTimer = processStartTime = Time::now();
   lastKnownDone = lastKnownTotal = lastKnownProgressUpdate = clockSkew = 0;
   lastKnownProgressUpdateRunTime = getRunTime(); // Start the stall timer
+  lastRuntimeSaveAttempt = lastKnownProgressUpdateRunTime;
   insert("start_time", Time(processStartTime).toString());
   insert("pid", pid);
 }
@@ -539,10 +579,37 @@ void Unit::updateKnownProgress(uint64_t done, uint64_t total) {
   if (!total || total < done) return;
 
   if (lastKnownDone != done || lastKnownTotal != total) {
+    const uint64_t runTime = getRunTime();
+    const bool first =
+      !lastKnownTotal || (!estimateBaselineDone && done);
+    const bool inconsistent =
+      lastKnownTotal &&
+      (lastKnownTotal != total || done < lastKnownDone ||
+       runTime < lastKnownProgressUpdateRunTime);
+
+    if (first || inconsistent) {
+      estimateBaselineDone = done;
+      estimateBaselineRunTime = runTime;
+      estimateBaselineTime = 0;
+
+      // Reconstruct the effective time at the resumed progress.
+      if (!inconsistent && done && isfinite(resumeProgress) &&
+          resumeProgress > 0 && resumeProgress <= 1) {
+        const double previousEstimate =
+          (double)getU64("run_time", 0) / resumeProgress;
+
+        if (isfinite(previousEstimate) && previousEstimate >= 1 &&
+            previousEstimate < (double)UINT64_MAX)
+          estimateBaselineTime = previousEstimate * ((double)done / total);
+      }
+
+      if (done || inconsistent) resumeProgress = 0;
+    }
+
     lastKnownDone                  = done;
     lastKnownTotal                 = total;
     lastKnownProgressUpdate        = Time::now();
-    lastKnownProgressUpdateRunTime = getRunTime();
+    lastKnownProgressUpdateRunTime = runTime;
 
     // Only progress past where it stalled proves the core recovered
     if (stallDone < done) stalls = 0;
@@ -946,6 +1013,14 @@ void Unit::monitorRun() {
     if (eta != getString("eta", "")) insert("eta", eta);
     if (ppd != getU64("ppd", -1))    insert("ppd", ppd);
     setProgress(getEstimatedProgress(), 1, true);
+
+    // Limit periodic save attempts even when a database write fails.
+    const uint64_t runTime = getRunTime();
+    if (runTime >= lastRuntimeSaveAttempt &&
+        runTime - lastRuntimeSaveAttempt >= 5 * Time::SEC_PER_MIN) {
+      lastRuntimeSaveAttempt = runTime;
+      save();
+    }
 
     // Stop a core that has stopped making progress
     if (isStalled()) {
