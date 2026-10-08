@@ -31,6 +31,7 @@
 #include "Group.h"
 
 #include <cbang/json/Observable.h>
+#include <map>
 
 
 namespace FAH {
@@ -39,14 +40,23 @@ namespace FAH {
 
     class Groups : public cb::JSON::ObservableDict {
       App &app;
+      bool configuring = false;
+
+      void delGroup(const std::string &name);
+      cb::JSON::ValuePtr proposeConfiguration(const cb::JSON::Value &configs) const;
+      void validateCPUConfiguration(
+        const std::map<std::string, cb::SmartPointer<Config>> &staged) const;
 
     public:
       Groups(App &app);
 
       const Group &getGroup(const std::string &name) const;
       Group &getGroup(const std::string &name);
-      void delGroup(const std::string &name);
+      // Supplied keys determine named-group membership; entries patch saved settings.
+      // Omitted Default is retained.
       void configure(const cb::JSON::Value &configs);
+      // True during configuration application/rollback; suppresses automatic Group saves/reconciliation.
+      bool isConfiguring() const {return configuring;}
       void triggerUpdate();
       void setState(const cb::JSON::Value &msg);
       bool getPaused() const;
