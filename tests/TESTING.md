@@ -27,14 +27,14 @@ These are part of the public API between client, AS, WS, and frontend.
 Changes here break compatibility:
 
 - `UnitState` enum names (`UNIT_ASSIGN`, `UNIT_DOWNLOAD`, `UNIT_CORE`,
-  `UNIT_RUN`, `UNIT_UPLOAD`, `UNIT_DUMP`, `UNIT_DONE`) — JSON values.
+  `UNIT_RUN`, `UNIT_UPLOAD`, `UNIT_DUMP`, `UNIT_DONE`) â€” JSON values.
 - `CoreState` enum names.
 - `ExitCode` enum values (numeric, set by science core binary).
-- AS request/response JSON shape — see `Unit::writeRequest`,
+- AS request/response JSON shape â€” see `Unit::writeRequest`,
   `Unit::assignResponse`.
-- WS download/upload/dump JSON shape — see `Unit::downloadResponse`,
+- WS download/upload/dump JSON shape â€” see `Unit::downloadResponse`,
   `Unit::upload`, `Unit::dump`.
-- The observable JSON tree the frontend sees — see `App::loadConfig`
+- The observable JSON tree the frontend sees â€” see `App::loadConfig`
   for the `info` shape and the default group JSON
   (`src/resources/group.json`) for `config`.
 
@@ -42,36 +42,36 @@ Changes here break compatibility:
 
 In approximate priority order:
 
-1. **Unit state machine progression** — happy path
-   `ASSIGN → DOWNLOAD → CORE → RUN → UPLOAD → DONE`.
-2. **Retry / backoff** — failure responses trigger correct delay,
+1. **Unit state machine progression** â€” happy path
+   `ASSIGN â†’ DOWNLOAD â†’ CORE â†’ RUN â†’ UPLOAD â†’ DONE`.
+2. **Retry / backoff** â€” failure responses trigger correct delay,
    correct retry-cap behavior, switch to CS list on upload failure.
-3. **Dump path** — invalid response, missing results, expired WU, user
+3. **Dump path** â€” invalid response, missing results, expired WU, user
    "dump" command from all reachable states.
-4. **Pause / resume** — during each state, scheduler-driven pause vs.
+4. **Pause / resume** â€” during each state, scheduler-driven pause vs.
    user-driven pause, finish-on-complete semantics.
-5. **Group scheduler resource allocation** — CPU/GPU partition under
+5. **Group scheduler resource allocation** â€” CPU/GPU partition under
    competing units, max-WU cap, finish mode, GPU minimum-CPU requirement.
-6. **Persistence** — unit serialized to DB across each transition;
+6. **Persistence** â€” unit serialized to DB across each transition;
    restart loads units and resumes correctly; `UNIT_RUN` is reset to
    `UNIT_CORE` on load.
-7. **Core process exit-code handling** — every `ExitCode` mapped to the
+7. **Core process exit-code handling** â€” every `ExitCode` mapped to the
    correct next state in `finalizeRun()`.
-8. **Signature verification** — AS/WS response with bad cert / bad
+8. **Signature verification** â€” AS/WS response with bad cert / bad
    signature / wrong key-usage is rejected (negative tests).
-9. **Clock skew detection** — large `Time::now()` jump during run gets
+9. **Clock skew detection** â€” large `Time::now()` jump during run gets
    detected and time estimates adjusted.
-10. **Account state machine** — link/connect/retry with backoff.
-11. **Config merge** — defaults + DB + options + remote updates.
+10. **Account state machine** â€” link/connect/retry with backoff.
+11. **Config merge** â€” defaults + DB + options + remote updates.
 
 ## Where to look next
 
-- `Unit::next()` in `Unit.cpp` — `next()`, the state-machine dispatcher.
-- `Group::update()` in `Group.cpp` — `update()`, the resource scheduler.
-- `App::init()` / `App::run()` in `App.cpp` — `init()`/`run()`, the startup path.
-- `src/resources/group.json` — default config shape (the JSON the
+- `Unit::next()` in `Unit.cpp` â€” `next()`, the state-machine dispatcher.
+- `Group::update()` in `Group.cpp` â€” `update()`, the resource scheduler.
+- `App::init()` / `App::run()` in `App.cpp` â€” `init()`/`run()`, the startup path.
+- `src/resources/group.json` â€” default config shape (the JSON the
   frontend sees).
-- `Account.cpp` — the account-bridge state machine, the part of the
+- `Account.cpp` â€” the account-bridge state machine, the part of the
   client most likely to surprise you.
 
 ## CPU affinity regression targets
@@ -268,3 +268,5 @@ is shipped. Frozen reference sources are test fixtures, not production helpers.
 ## Config field validation
 
 `ConfigTests` is built and run with the ordinary native test suites. It links real Config and cbang JSON code using the shipped group defaults. It covers malformed v6 fields, numeric boundaries, valid saved class intent, dormant General-mode counts, unsupported priority loading and retained saturation/legacy loading behavior. The GPU validation adapter retains pure reservation-capacity tests; API rejection and persistence are checked by `api-configuration-smoke.py`.
+
+The `cpu-affinity-v8-tests` branch contains the v8 implementation and its full regression suites. The production `cpu-affinity-v8` branch keeps upstream tests and build CI only.
