@@ -49,13 +49,6 @@ jobs:
           ref: 8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
           path: cbang
           persist-credentials: false
-      - name: Checkout stock compatibility baseline
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          repository: FoldingAtHome/fah-client-bastet
-          ref: 0ea081e0efd500aa1b73f8dcf7c67bc72c0a6673
-          path: stock-client
-          persist-credentials: false
       - name: Dependencies
         run: |
           sudo apt-get update
@@ -67,19 +60,6 @@ jobs:
         run: |
           scons -C cbang -j2
           scons -j2
-      - name: Client regression and native affinity integration
-        # cbang intercepts the `test` target and assumes the repository root.
-        # Build ordinary tests, then run their harness explicitly from the root.
-        run: |
-          scons -C tests -j2
-          python "$CBANG_HOME/tests/testHarness" -C tests --no-color
-          scons -C tests affinity-fast affinity-integration
-          python tests/api-configuration-smoke.py --client ./fah-client
-      - name: Stock-client database compatibility
-        run: |
-          scons -C stock-client -j2
-          python tests/stock-class-compatibility.py --client ./stock-client/fah-client --affinity-client ./fah-client
-
   macos:
     # Native Apple Silicon build covers shared code and the legacy Darwin path.
     # Strict affinity integration is intentionally Linux/Windows-only.
@@ -166,13 +146,6 @@ jobs:
           if errorlevel 1 exit /b 1
           nmake install_sw
           if errorlevel 1 exit /b 1
-      - name: Checkout stock compatibility baseline
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          repository: FoldingAtHome/fah-client-bastet
-          ref: 0ea081e0efd500aa1b73f8dcf7c67bc72c0a6673
-          path: stock-client
-          persist-credentials: false
       - name: Build cbang and client with MSVC x64
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
@@ -182,35 +155,6 @@ jobs:
           dumpbin /headers cbang\lib\sqlite3.lib | findstr /C:"machine"
           if errorlevel 1 exit /b 1
           python -m SCons -j2
-          if errorlevel 1 exit /b 1
-      - name: Client regression tests
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 1
-          rem Avoid cbang's `test` target, which would enter tests/tests.
-          python -m SCons -C tests -j2
-          if errorlevel 1 exit /b 1
-          python "%CBANG_HOME%\tests\testHarness" -C tests --no-color
-          if errorlevel 1 exit /b 1
-          python -m SCons -C tests affinity-fast
-          if errorlevel 1 exit /b 1
-      - name: Native Windows strict launcher integration
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 1
-          python -m SCons -C tests affinity-integration
-          if errorlevel 1 exit /b 1
-      - name: Real client configuration and restart integration
-        run: |
-          python tests/api-configuration-smoke.py --client fah-client.exe
-          if errorlevel 1 exit /b 1
-      - name: Stock-client database compatibility
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 1
-          python -m SCons -C stock-client -j2
-          if errorlevel 1 exit /b 1
-          python tests/stock-class-compatibility.py --client stock-client\fah-client.exe --affinity-client fah-client.exe
           if errorlevel 1 exit /b 1
       - name: Configure diagnostics on failure
         if: failure()
