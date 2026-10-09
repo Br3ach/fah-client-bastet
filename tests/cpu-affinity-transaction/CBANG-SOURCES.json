@@ -1,8 +1,0 @@
-{
-  "src/cbang/db/Database.cpp": "19a6bbc822f4e37d12e016d6064069ba0a5cc49da2c6fb8a0caf0f46d1a87a6e",
-  "src/cbang/db/Transaction.cpp": "18d1afd7bac3e6855acfb3385317ef69ed6bdb32c4cbf3613441b2ee3c8d20ed",
-  "src/sqlite3/sqlite3.c": "f866df45f4dd72dfe2a54fae2bb037c8d55dce5d4cf58be9afa08a6c760e807c",
-  "src/sqlite3/sqlite3.h": "597dbea8fb30377cf7f2b2641060dd752cebe1e0edf6b98480f9e9644ee237ad",
-  "src/cbang/db/Transaction.h": "fe64c2be81ecb1126f072eb4c1ed96d2783bd7842fbb8fb36326c63679197159",
-  "src/cbang/db/Database.h": "53a130b280b07a3aaf9fe4309bf2118173f09f9ebe44e42177703480bd403296"
-}
