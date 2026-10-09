@@ -6,8 +6,9 @@ foldingathome.org client software code named "bastet".
 
 ## Developer regression tests
 
-For the ordinary client suite, CPU-affinity regression suites, native launch
-checks and compatibility tests, see [Developer testing instructions](tests/TESTING.md#cpu-affinity-regression-targets).
+The upstream suite remains in `tests`. The v8 affinity regression suites,
+native launch checks and compatibility tests are retained on the
+`cpu-affinity-v8-tests` branch, including their developer instructions and CI.
 The tester guide below covers installation and manual testing.
 
 ## CPU-affinity v6 manual testing
