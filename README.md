@@ -115,12 +115,12 @@ npm run dev
 With the development server running, open http://localhost:5173/ in a browser to
 view the client frontend.
 
-## CPU-affinity v6 dependencies
+## CPU-affinity v8 dependencies
 
-CPU-affinity v6 CI pins the topology API in official cbang revision
+CPU-affinity v8 CI pins the topology API in official cbang revision
 `8acdbdf374fa1a8bc1e7ebeed2e98770617030e3`:
 https://github.com/CauldronDevelopmentLLC/cbang/commit/8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
-For reproducible v6 builds, check out this revision before building cbang:
+For reproducible v8 builds, check out this revision before building cbang:
 
 ```
 git -C cbang checkout 8acdbdf374fa1a8bc1e7ebeed2e98770617030e3
@@ -169,7 +169,7 @@ any stopping FahCore retains live ownership until it exits.
 
 A stock client can load these settings and retain the general CPU totals. It
 removes unsupported class, GPU reservation and GPU priority settings when saving.
-Returning to v6 therefore requires selecting those preferences again.
+Returning to v8 therefore requires selecting those preferences again.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#cpu-policy-runtime-ownership-and-live-affinity)
 for allocation and launch contracts, and [TESTING.md](TESTING.md) for tester and

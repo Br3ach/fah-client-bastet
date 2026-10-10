@@ -36,6 +36,7 @@ permissions:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       CBANG_HOME: ${{ github.workspace }}/cbang
     steps:
