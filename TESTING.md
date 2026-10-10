@@ -10,9 +10,9 @@ For the ordinary client suite, CPU-affinity regression suites, native launch
 checks and compatibility tests, see [Developer testing instructions](tests/TESTING.md#cpu-affinity-regression-targets).
 The tester guide below covers installation and manual testing.
 
-## CPU-affinity v6 manual testing
+## CPU-affinity v8 manual testing
 
-Use matching v6 client and Web Control revisions. Record both revisions, the
+Use matching v8 client and Web Control revisions. Record both revisions, the
 cbang revision, OS, CPU model, enabled GPUs and relevant group settings.
 Use the supplied local Web Control for affinity settings; the hosted interface
 may not expose this branch's options.
@@ -34,7 +34,7 @@ process affinity/priority where the OS supports inspection:
   overrides live; Linux changes take effect on the next launch and core support
   determines whether the requested priority is retained.
 - Graceful stop from Windows tray/service contexts, not only terminal consoles.
-- Save/restart persistence and stock-client rollback, which strips v6-only fields.
+- Save/restart persistence and stock-client rollback, which strips v8 affinity fields.
 
 Synthetic tests do not establish real hybrid topology correctness, performance,
 or every installed service environment. Include logs and reproduction steps in
@@ -44,7 +44,7 @@ Detailed policy and limitations are in [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Older Bastet installation guide
 
 The following guide describes the original Bastet transition. Its alpha builds
-and hosted Web Control are not the v6 tester package.
+and hosted Web Control are not the v8 tester package.
 
 ## Install
 
