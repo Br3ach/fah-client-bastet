@@ -87,7 +87,7 @@ namespace {
     TopologySnapshot result;
     result.available = std::move(available);
     result.rawLevels = std::move(rawLevels);
-    result.hard = supportsStrictAffinity() && !result.available.empty();
+    result.hard = !result.available.empty();
     // Persistent class indexes follow raw topology. Effective masks preserve
     // those indexes, including empty classes under process/cpuset restrictions.
     CPUSet rawCovered;
