@@ -47,7 +47,7 @@ bool accept(const CPU &cpu,uint64_t reservedCores,uint64_t total,vector<uint64_t
  for(const auto &level:cpu.levels)t.effectiveClassCapacity.push_back(level.size());
  for(const auto &core:cpu.cores)t.fastCoreWidths.push_back(core.size());
  V::Request gpu;gpu.name="GPU";gpu.mode="count";gpu.gpus={"gpu"};gpu.reservedCores=reservedCores;
- V::Request cpus;cpus.name="CPU";cpus.mode="classes";cpus.hasClassCounts=true;
+ V::Request cpus;cpus.name="CPU";cpus.mode="classes";
  uint64_t sum=0;for(auto count:counts){cpus.classCounts.push_back(count);sum+=count;}cpus.workers=sum;
  V::Request extra;extra.name="Extra";extra.mode="count";extra.workers=total>sum?total-sum:0;
  V::Request helper;helper.name="Shared";helper.mode="count";if(shared)helper.gpus={"helper"};
@@ -77,7 +77,7 @@ int main() {
  // Device selection still changes active demand with an unchanged per-device setting.
  auto extra=saved;extra.gpus.insert("GPU1");
  assert(!V::validate(unavailable,{saved},{extra}).valid);
- V::Request wide;wide.name="CPU";wide.mode="classes";wide.hasClassCounts=true;wide.classCounts={4294967295u,4294967295u};
+ V::Request wide;wide.name="CPU";wide.mode="classes";wide.classCounts={4294967295u,4294967295u};
  result=V::validate(topology,{}, {wide});
  assert(!result.valid && result.error.find("4294967295")!=string::npos);
 '''+r''' CPU c;

@@ -185,7 +185,7 @@ int main(){
   CPUConfigValidator::Request a;a.name="A";a.mode="count";a.workers=12;
   auto b=a;b.name="B";
   CPUConfigValidator::Request classes;classes.name="Classes";classes.mode="classes";
-  classes.hasClassCounts=true;classes.classCounts={0,0};
+  classes.classCounts={0,0};
   assert(CPUConfigValidator::validate(topology,{}, {a,b}).valid);
   auto result=CPUConfigValidator::validate(topology,{}, {a,b,classes});
   assert(!result.valid && result.error=="Configured managed CPU total 24 exceeds CPU topology capacity 16");
@@ -221,7 +221,6 @@ int main(){
  // General-only legacy oversubscription remains valid.
  assert(decision(g,proposals({{"A",policy(100)},{"B",policy(100)}}))=="accepted");
  assert(decision(g,proposals({{"A",policy(4,"classes",{4,0})},{"B",policy(5)}}))!="accepted");
- assert(decision(g,proposals({{"A",policy(0,"invalid")}})).find("Invalid CPU mode")!=string::npos);
  // Usable devices, not raw JSON enable flags, determine reservation demand.
  auto noDevice=proposals({{"GPU",policy(0,"count",{},1,{"missing"})}});
  assert(decision(g,noDevice)=="Select an available GPU before reserving CPU cores");

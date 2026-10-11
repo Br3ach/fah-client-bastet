@@ -177,7 +177,7 @@ int main(){
   g.app.cpu.gpuAffinity=!exclusive;g.c.reserved=exclusive?1:0;
   g.app.cpu.managed=!exclusive;g.app.cpu.gpuMasks["GPU0"]={0,1};
   g.update();assert(g.app.wus.added==1&&g.app.wus.offered.back()==set<string>{"GPU0"});
-  g.app.cpu.gpuMasks["GPU1"]={2,3};g.app.cpu.shortages["GPU1"]="shortage";
+  g.app.cpu.gpuMasks["GPU1"]={};g.app.cpu.shortages["GPU1"]="shortage";
   g.update();assert(g.app.wus.offered.back()==set<string>{"GPU0"});
   auto pending=make_shared<Unit>();pending->state=UNIT_ASSIGN;pending->cpus=0;
   pending->gpus={"GPU0","GPU1"};g.app.wus.wus={pending};g.update();

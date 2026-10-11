@@ -808,7 +808,6 @@ vector<string> Unit::buildCoreArgs(const RunningCPUAllocation &allocation) const
 
   auto &gpus = *get("gpus");
   if (gpus.size()) {
-    if (gpus.size() != 1) THROW("FahCore launch requires exactly one assigned GPU");
     string id = gpus.getString(0);
     auto &gpu = *app.getGPUs().get(id).cast<GPUResource>();
 
@@ -910,9 +909,7 @@ RunningCPUAllocation Unit::buildDesiredAllocation() const {
   if (!desired.isManaged()) return desired;
 
   if (hasGPUs()) {
-    // Candidate or malformed multi-device lists never become launch ownership.
     const auto gpus = getGPUs();
-    if (gpus.size() != 1) return desired;
     // Helper counts are accounting metadata, not a minimum mask size.
     // Shared/reserved helpers may time-share LPs; an empty pool blocks launch.
     desired.resourcePool = cpu.getGPUCPUs(group->getName(), *gpus.begin());

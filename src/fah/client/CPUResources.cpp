@@ -87,7 +87,7 @@ namespace {
     TopologySnapshot result;
     result.available = std::move(available);
     result.rawLevels = std::move(rawLevels);
-    result.hard = supportsStrictAffinity() && !result.available.empty();
+    result.hard = !result.available.empty();
     // Persistent class indexes follow raw topology. Effective masks preserve
     // those indexes, including empty classes under process/cpuset restrictions.
     CPUSet rawCovered;
@@ -118,8 +118,7 @@ namespace {
     for (auto &raw: result.rawLevels) {
       CPUSet level = intersectCPUs(raw, result.available);
       result.levels.push_back(level); // Preserve indexes even when currently empty.
-      for (auto cpu: level)
-        if (!effectiveCovered.insert(cpu).second) result.validEffectiveLevels = false;
+      effectiveCovered.insert(level.begin(), level.end());
     }
 
     if (effectiveCovered != result.available) result.validEffectiveLevels = false;
