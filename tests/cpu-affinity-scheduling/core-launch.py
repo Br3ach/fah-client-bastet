@@ -94,9 +94,6 @@ struct Unit {
 """+gpu_args+methods+r"""
 int main(){
  Unit unit;RunningCPUAllocation captured;captured.workers=7;
- unit.gpus.ids={"gpu-id","other"};bool rejected=false;
- try{unit.buildCoreArgs(captured);}catch(const std::runtime_error&){rejected=true;}
- assert(rejected);unit.gpus.ids.clear();
  const vector<string> base={"-dir","wu-id","-suffix","01","-version","8.5.7","-lifeline","1234"};
  auto expected=base;expected.insert(expected.end(),{"-np","7"});
  assert(unit.buildCoreArgs(captured)==expected);

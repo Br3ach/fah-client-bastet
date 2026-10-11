@@ -133,7 +133,8 @@ def run(exe,folder,port,edit=False):
   (folder/'snapshot.json').write_text(json.dumps(initial,indent=2))
   if edit == "reject":
    baseline=configuration_state(initial)
-   for invalid in [{'cpus':1.5},{'cpus':-1},{'cpus':4294967296},
+   for invalid in [{'cpu_mode':'invalid'},{'cpu_mode':1},
+                   {'cpus':1.5},{'cpus':-1},{'cpus':4294967296},
                    {'cpu_class_counts':[1.5]},{'cpu_class_counts':[-1]},
                    {'cpu_class_counts':[4294967296]},
                    {'gpu_reserved_cores':1.5}, {'gpu_reserved_cores':-1},
@@ -141,7 +142,7 @@ def run(exe,folder,port,edit=False):
                     {'gpu_priority':'invalid'}, {'gpu_priority':3}]:
     invalid_socket,_=open_websocket(port)
     send(invalid_socket,{'cmd':'config','time':change_time(),
-            'config':{'groups':{'':{**invalid,'paused':True,'cpu_mode':'count'}}}})
+            'config':{'groups':{'':{'paused':True,'cpu_mode':'count',**invalid}}}})
     rejected=[];invalid_socket.settimeout(.2)
     try:
      while True:rejected.append(frame_recv(invalid_socket))
@@ -153,7 +154,7 @@ def run(exe,folder,port,edit=False):
     actual=current['groups']['']['config']
     assert actual['cpus']==6 and actual['cpu_class_counts']==[],(invalid,actual)
     assert all(g['']['config']['cpus']==6 for g in groups),(invalid,rejected)
-   print('PASS: fractional, negative and overflowing CPU and class counts rejected before mutation')
+   print('PASS: invalid CPU modes and fractional, negative and overflowing CPU and class counts rejected before mutation')
   if edit is True:
    send(s,{'cmd':'config','time':change_time(),'config':{'groups':{'':{'cpus':5,'paused':True,'cpu_mode':'count','pin_to_perf_cores':True,
               'gpu_priority': ('normal' if os.name=='nt' else 'other-normal')}}}})

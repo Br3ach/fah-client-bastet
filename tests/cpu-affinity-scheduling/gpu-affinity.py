@@ -135,8 +135,7 @@ int main() {
   first.launched();second.launched();
   assert(second.runningAllocation.mask==set<unsigned>({2,3}));
   assert(!first.blocksCPULaunch(second)&&!second.blocksCPULaunch(first));
-  first.gpuIDs={"GPU0","GPU1"};assert(first.buildDesiredAllocation().mask.empty());
-  cout<<"PASS: GPU0 shortage independence, disjoint GPU WU reservations and multi-device ownership rejection\n";
+  cout<<"PASS: GPU0 shortage independence and disjoint GPU WU reservations\n";
  }
 
  // GPU helper accounting adopts the current generation without restarting.

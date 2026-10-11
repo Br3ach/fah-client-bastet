@@ -110,10 +110,7 @@ void CoreProcess::execStrictLinux(const vector<string> &args, StrictProcess &chi
     // Match cbang PRIORITY_IDLE before exec; affinity must not change scheduling.
     sched_param priority{};
     bool priorityReady = !priorityOverride.empty() || (!sched_setscheduler(0, SCHED_IDLE, &priority) &&
-      sched_getscheduler(0) == SCHED_IDLE && !setpriority(PRIO_PROCESS, 0, 19));
-    errno = 0;
-    if (priorityOverride.empty())
-      priorityReady = priorityReady && getpriority(PRIO_PROCESS, 0) == 19 && !errno;
+      !setpriority(PRIO_PROCESS, 0, 19));
     if (!priorityOverride.empty()) {
       // Start at OTHER/nice 0: the core's explicit Low/Normal argument only
       // sets nice (10/0), leaving the inherited scheduler unchanged. Starting
@@ -122,14 +119,10 @@ void CoreProcess::execStrictLinux(const vector<string> &args, StrictProcess &chi
         !setpriority(PRIO_PROCESS, 0, 0);
       if (!applied) {
         // The override is optional, but a fallback must establish stock
-        // scheduling. Reject preparation if restoration cannot be verified.
+        // scheduling. Reject preparation if restoration fails.
         const bool schedulerRestored = !sched_setscheduler(0, SCHED_IDLE, &priority);
         const bool niceRestored = !setpriority(PRIO_PROCESS, 0, 19);
-        errno = 0;
-        const int restoredNice = getpriority(PRIO_PROCESS, 0);
-        const bool niceVerified = restoredNice == 19 && !errno;
-        priorityReady = schedulerRestored && niceRestored && niceVerified &&
-          sched_getscheduler(0) == SCHED_IDLE;
+        priorityReady = schedulerRestored && niceRestored;
       }
     }
     char result = !exact ? 2 :

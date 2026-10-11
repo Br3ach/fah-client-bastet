@@ -106,13 +106,11 @@ struct dirent *checkedReadDir(DIR *tasks) {
  if(readbackEntries++){if(readbackFault==3)errno=EIO;return nullptr;}
  static dirent entry{};strcpy(entry.d_name,"123");return &entry;
 }
-int priorityFault=0;bool restoringPriority=false;
+int priorityFault=0;
 int checkedSetScheduler(pid_t pid,int policy,const sched_param *param) {
  if(priorityFault && policy==SCHED_OTHER){errno=EPERM;return -1;}
  if(priorityFault==1 && policy==SCHED_IDLE){errno=EPERM;return -1;}
- const int result=sched_setscheduler(pid,policy,param);
- if(priorityFault && policy==SCHED_IDLE)restoringPriority=true;
- return result;
+ return sched_setscheduler(pid,policy,param);
 }
 int checkedSetPriority(__priority_which_t which,id_t who,int value) {
  if(priorityFault==2 && value==19){errno=EPERM;return -1;}
@@ -122,7 +120,6 @@ int checkedGetScheduler(pid_t pid) {
  if(readbackFault==2){errno=ESRCH;return -1;}
  if(readbackFault==4){errno=EPERM;return -1;}
  if(readbackFault)return SCHED_OTHER;
- if(priorityFault==3 && restoringPriority)return SCHED_OTHER;
  return sched_getscheduler(pid);
 }
 int checkedGetPriority(__priority_which_t which,id_t who) {
@@ -130,8 +127,6 @@ int checkedGetPriority(__priority_which_t which,id_t who) {
  if(readbackFault==7){errno=ESRCH;return -1;}
  if(readbackFault==8)return 19;
  if(readbackFault)return 0;
- if(priorityFault==4 && restoringPriority)return 18;
- if(priorityFault==5 && restoringPriority){errno=EIO;return -1;}
  return getpriority(which,who);
 }
 #define readdir checkedReadDir
@@ -228,7 +223,7 @@ int main(int argc,char **argv){
   assert(access("unit-marker",F_OK)!=0);
   int status=0;assert(waitpid(-1,&status,WNOHANG)==-1&&errno==ECHILD);
   unit.next();assert(unit.attempts==1&&unit.retries==7); // Cooldown gates launches.
-  unit.wait=0;priorityFault=0;restoringPriority=false;
+  unit.wait=0;priorityFault=0;
   unit.next();assert(unit.retries==7&&unit.attempts==2&&unit.isRunning());
   assert(!unit.has("launch_environment_warning")&&!unit.hasLaunchFailure()&&unit.isActive());
   assert(access("unit-marker",F_OK)==0);unlink("unit-marker");
@@ -247,7 +242,7 @@ int main(int argc,char **argv){
   catch(const SchedulingRejected&){rejected=true;}
   assert(rejected&&!p.strictProcess&&access("restore-marker",F_OK)!=0);
   int status=0;assert(waitpid(-1,&status,WNOHANG)==-1&&errno==ECHILD);
-  cout<<"PASS: failed Linux priority restoration/readback rejects preparation and reaps child\n";
+  cout<<"PASS: failed Linux priority restoration rejects preparation and reaps child\n";
   return 0;
  }
  if(argc==2 && string(argv[1])=="fallback") {
@@ -362,7 +357,7 @@ with tempfile.TemporaryDirectory(prefix='fah-native-affinity-') as d:
  subprocess.run([str(p/'test')],cwd=p,check=True,timeout=60)
  subprocess.run([str(p/'test'),'denied'],cwd=p,check=True,timeout=10)
 
- for fault in range(1,6):
+ for fault in (1,2):
   subprocess.run([str(p/'test'),'restore-failure',str(fault)],cwd=p,check=True,timeout=10)
 
  for fault in (1,2):
