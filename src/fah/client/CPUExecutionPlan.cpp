@@ -139,9 +139,7 @@ std::optional<CPUExecutionPlan::SliceExecution> CPUExecutionPlan::createSlices(u
     auto plan = CPUExecutionPlan::create(type, allocation.workers,
       allocation.pool, cores, order);
     if (plan.mask.size() < allocation.workers) return std::nullopt;
-    for (auto cpu: plan.mask)
-      if (!allocation.pool.count(cpu) || !result.mask.insert(cpu).second)
-        return std::nullopt;
+    result.mask.insert(plan.mask.begin(), plan.mask.end());
     result.levels[level] = std::move(plan);
   }
   if (result.mask.empty()) return std::nullopt;

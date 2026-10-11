@@ -255,7 +255,6 @@ void Groups::validateCPUConfiguration(
     result.name = name; result.mode = config.getCPUMode();
     result.workers = config.getConfiguredCPUTotal();
     result.classCounts = config.getCPUClassCounts();
-    result.hasClassCounts = config.hasList("cpu_class_counts");
     result.reservedCores = config.getGPUReservedCores(); result.gpus = config.getGPUs();
     return result;
   };

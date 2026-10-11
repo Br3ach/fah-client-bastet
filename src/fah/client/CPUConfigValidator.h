@@ -49,12 +49,12 @@ public:
     std::string name, mode;
     uint64_t workers = 0;
     std::vector<uint32_t> classCounts;
-    bool hasClassCounts = false;
     uint32_t reservedCores = 0;
     // Usable enabled GPU IDs resolved by the caller.
     std::set<std::string> gpus;
   };
   struct Result {bool valid = false; std::string error;};
+  // Modes/counts are parsed from validated Configs.
   // Names must be unique within each list; duplicates return an invalid result.
   static Result validate(const Topology &, const std::vector<Request> &current,
     const std::vector<Request> &proposed);

@@ -119,9 +119,6 @@ void validateCPURequests(const Topology &topology, const Requests &previous,
     auto saved = previous.find(name);
     const Request *old = saved == previous.end() ? nullptr : &saved->second;
     const auto &mode = candidate.mode;
-    if (mode != "count" && mode != "classes") {
-      reject("Invalid CPU mode '", mode, "' for resource group '", name, "'");
-    }
 
     const auto &proposedCounts = candidate.classCounts;
     // Retain wide validation sums rather than Config's saturated class total.
@@ -143,10 +140,6 @@ void validateCPURequests(const Topology &topology, const Requests &previous,
         reject("CPU performance-class allocation is not currently configurable");
       }
 
-      if (!candidate.hasClassCounts) {
-        reject("Class CPU mode requires cpu_class_counts");
-      }
-
       if (!unchanged && proposedCounts.size() != levels.size()) {
         reject("CPU class count does not match current performance-level count");
       }
@@ -163,7 +156,6 @@ void validateCPURequests(const Topology &topology, const Requests &previous,
 }
 // Enforce changed allocation limits, retaining legacy General oversubscription.
 void validateTotals(const Topology &topology, const State &state) {
-  const auto &levels = topology.rawClassCapacity;
   const bool sharedBlocked = state.sharedGPURequested &&
     !state.classCapacity.empty() && !state.classCapacity.front();
   const char *sharedShortage =
@@ -202,10 +194,6 @@ void validateTotals(const Topology &topology, const State &state) {
   // If class configuration cannot currently be edited, unchanged persisted
   // class policy may survive while other RGs are reset/removed.
   if (!topology.configurableClasses) {
-    return;
-  }
-
-  if (levels.size() < 2) {
     return;
   }
 

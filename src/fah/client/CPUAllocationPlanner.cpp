@@ -112,7 +112,6 @@ namespace {
     map<string, vector<unsigned>> classBudgets;
     map<string, unsigned> targets;
     CPUList order, generalOrder;
-    bool classTopologyUsable = false;
     CPUWholeCorePacking::Pools assign(const map<string, unsigned> &demand, const CPUList &order);
     void allocateClasses(const vector<string> &names, bool useClasses);
     void spreadClassPools(const vector<string> &names, bool useClasses);
@@ -419,7 +418,7 @@ CPUWholeCorePacking::Pools Planner::assign(
 void Planner::allocateClasses(const vector<string> &names, bool useClasses) {
   // Explicit classes have priority. Allocate whole cores, never LPs that
   // could later be expanded into another group's physical-core pool.
-  if (useClasses && classTopologyUsable)
+  if (useClasses && effectiveClasses)
     for (unsigned i = 0; i < allocatablePerformanceLevels.size(); ++i) {
       vector<pair<string, unsigned>> requested;
       for (const auto &name: names) {
@@ -568,19 +567,10 @@ void Planner::build() {
   // deterministic allocation, not time-based fairness or rotating priority.
   configureGPUAllocations();
   bool anyClass = false;
-  classTopologyUsable = effectiveClasses;
   for (const auto &entry: requests)
     if (entry.second.classes)
       anyClass |= any_of(entry.second.classCounts.begin(), entry.second.classCounts.end(),
         [](uint32_t count) {return count != 0;});
-  // Unknown/ambiguous class topology blocks class work, not General demand.
-  // Whole physical cores cannot straddle selected performance levels.
-  for (const auto &core: coreThreads) {
-    unsigned matches = 0;
-    for (const auto &level: performanceLevels)
-      if (!intersectCPUs(core, level).empty()) ++matches;
-    if (matches > 1) classTopologyUsable = false;
-  }
   if (!anyClass && !homogeneous && gpuReservedCPUs.empty()) {
     // General hybrid/unknown topology retains the legacy OS scheduler.
     return;
@@ -590,7 +580,7 @@ void Planner::build() {
     runtimeFallbackReason = affinityUnavailableReason;
   } else {
     managed = true;
-    if (anyClass && !classTopologyUsable) {
+    if (anyClass && !effectiveClasses) {
       runtimeFallback = true;
       runtimeFallbackReason = "performance-class topology unavailable; class CPU folding is waiting";
     }
