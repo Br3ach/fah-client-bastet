@@ -428,8 +428,7 @@ void Group::updateAssignmentOffer(unsigned remainingCPUs,
   // helper allocations. Legacy GPU scheduling does not require a helper mask.
   if (cpuResources.supportsGPUAffinity() || config->getGPUReservedCores()) {
     for (auto it = remainingGPUs.begin(); it != remainingGPUs.end();) {
-      if (cpuResources.getGPUCPUs(name, *it).empty() ||
-          !cpuResources.getGPUAllocationShortage(name, *it).empty())
+      if (cpuResources.getGPUCPUs(name, *it).empty())
         it = remainingGPUs.erase(it);
       else ++it;
     }

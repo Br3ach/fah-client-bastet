@@ -118,8 +118,7 @@ namespace {
     for (auto &raw: result.rawLevels) {
       CPUSet level = intersectCPUs(raw, result.available);
       result.levels.push_back(level); // Preserve indexes even when currently empty.
-      for (auto cpu: level)
-        if (!effectiveCovered.insert(cpu).second) result.validEffectiveLevels = false;
+      effectiveCovered.insert(level.begin(), level.end());
     }
 
     if (effectiveCovered != result.available) result.validEffectiveLevels = false;
