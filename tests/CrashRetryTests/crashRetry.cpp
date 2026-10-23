@@ -10,6 +10,7 @@
 #include <cbang/db/NameValueTable.h>
 #include <cbang/json/Reader.h>
 #include <cbang/os/SystemUtilities.h>
+#include <cbang/time/Time.h>
 #include <fstream>
 #include <cstdlib>
 #include <sstream>
@@ -49,7 +50,8 @@ public:
     child->exec({"--child", std::to_string(code), killed ? "wait" : "exit"});
     processStarted(child);
     if (killed) child->kill();
-    finalizeRun();
+    child->wait();
+    next();
   }
 };
 
@@ -57,7 +59,9 @@ class CrashRetryTest : public App {
   bool quitting = false;
   cb::SmartPointer<TestUnit> make(const std::string &id) {
     return new TestUnit(*this, parse(
-      "{\"data\":{\"request\":{},\"assignment\":{\"data\":{\"cpus\":1}}},"
+      "{\"data\":{\"request\":{\"data\":{\"time\":\"" +
+      cb::Time().toString() + "\"}},"
+      "\"assignment\":{\"data\":{\"cpus\":1,\"deadline\":86400}}},"
       "\"state\":{\"number\":1,\"id\":\"" + id + "\",\"group\":\"\","
       "\"state\":\"ASSIGN\",\"cpus\":1,\"gpus\":[],\"run_time\":0}}"));
   }
@@ -85,7 +89,8 @@ public:
     unit->exitWith(crash);
     require(unit->getState() == UnitState::UNIT_RUN, "first crash dumped WU");
     require(unit->getU32("crash_retries") == 1, "first crash not recorded");
-    require(unit->getRetries() == 1 && unit->isWaiting(), "no retry backoff");
+    require(unit->getRetries() == 0 && unit->isWaiting() && unit->getNumber("delay") == 2,
+      "crash backoff changed ordinary retries");
     unit->exitWith(crash);
     require(unit->getState() == UnitState::UNIT_DUMP, "second crash retried");
 
@@ -95,6 +100,17 @@ public:
     require(unit->getState() == UnitState::UNIT_RUN && unit->getRetries() == 2,
       "ordinary restart changed");
     require(!unit->has("crash_retries"), "ordinary restart spent crash budget");
+
+    unit = make("exhausted-budget");
+    for (unsigned i = 0; i < 9; ++i) unit->exitWith(ExitCode::CORE_RESTART);
+    require(unit->getRetries() == 9, "ordinary retry limit not reached");
+    unit->exitWith(crash);
+    require(unit->getState() == UnitState::UNIT_RUN && unit->getRetries() == 9 &&
+      unit->isWaiting() && unit->getNumber("delay") == 2,
+      "ordinary retry budget prevented crash recovery");
+    unit->exitWith(crash);
+    require(unit->getState() == UnitState::UNIT_DUMP,
+      "exhausted ordinary budget granted another crash recovery");
 
     unit = make("interrupted");
     unit->exitWith(ExitCode::INTERRUPTED);

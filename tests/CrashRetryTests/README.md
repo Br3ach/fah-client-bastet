@@ -7,7 +7,9 @@ python tests/CrashRetryTests/run.py tests/CrashRetryTests/crashRetry.exe
 ```
 
 The runner uses a temporary working directory and two separate processes to
-verify immediate SQLite persistence and restoration of the one-attempt budget.
+verify SQLite persistence through Unit::next() and restoration of the
+one-attempt budget. It also checks recovery with an exhausted ordinary retry
+budget and the independent two-second crash delay.
 It does not dispatch the client's event loop or contact assignment servers.
 Children return controlled Windows exception exit codes through the actual
 CoreProcess/Unit exit path. These tests do not reproduce a CUDA fault or verify
