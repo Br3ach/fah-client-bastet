@@ -1167,6 +1167,7 @@ void Unit::finalizeRun() {
   endLogCopy();
 
   ExitCode code = (ExitCode::enum_t)process->wait();
+  bool crashed = !code.isValid() || process->getDumpedCore();
 
 #ifdef _WIN32
   if (0xc0000000 <= (unsigned)code) {
@@ -1181,6 +1182,7 @@ void Unit::finalizeRun() {
   // it and let it resume from its last checkpoint.  The core validates the
   // checkpoint on startup and asks for a restart if it is invalid.
   if (process->getKilledByClient()) {
+    crashed = false;
     const unsigned maxStalls = 3;
 
     if (stalls <= maxStalls) {
@@ -1194,6 +1196,7 @@ void Unit::finalizeRun() {
     }
 
   } else if (process->getWasKilled()) {
+    crashed = process->getDumpedCore();
     LOG_ERROR("Core was killed");
     code = ExitCode::FAILED_1;
   }
@@ -1226,6 +1229,18 @@ void Unit::finalizeRun() {
   if (code == ExitCode::INTERRUPTED)  return;
   if (code == ExitCode::CORE_RESTART) return retry();
 
+  // Give a crashed core one fresh process to validate and resume its
+  // checkpoint.  Keep this limit separate from the ordinary retry counter,
+  // which resets after a core has run for two minutes.
+  string filename = getDirectory() + "/wuresults_01.dat";
+  if (crashed && !getU32("crash_retries", 0) &&
+      !SystemUtilities::exists(filename)) {
+    insert("crash_retries", 1);
+    save();
+    LOG_WARNING("Core crashed; retrying once from the last checkpoint");
+    return retry();
+  }
+
   if (!bytesCopiedToLog)
     LOG_ERROR("The folding core did not produce any log output.  This "
       "indicates that the core is not functional on your system.  Check "
@@ -1239,8 +1254,6 @@ void Unit::finalizeRun() {
   }
 
   // Read result data
-  string filename = getDirectory() + "/wuresults_01.dat";
-
   if (SystemUtilities::exists(filename)) {
     string resultData = SystemUtilities::read(filename);
     string hash64 = Digest::base64(resultData, "sha256");
