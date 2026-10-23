@@ -1236,9 +1236,8 @@ void Unit::finalizeRun() {
   if (crashed && !getU32("crash_retries", 0) &&
       !SystemUtilities::exists(filename)) {
     insert("crash_retries", 1);
-    save();
     LOG_WARNING("Core crashed; retrying once from the last checkpoint");
-    return retry();
+    return setWait(2);
   }
 
   if (!bytesCopiedToLog)
