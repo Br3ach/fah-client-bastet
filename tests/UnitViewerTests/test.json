@@ -1,0 +1,4 @@
+{
+  "command": "%(suite-dir)s/unitViewer",
+  "args": "--log-to-screen=false"
+}

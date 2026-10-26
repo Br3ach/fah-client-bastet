@@ -1,0 +1,5 @@
+Import('*')
+
+unitViewer = env.Program('unitViewer', 'unitViewer.cpp')
+
+Return('unitViewer')
