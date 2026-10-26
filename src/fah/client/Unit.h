@@ -33,6 +33,7 @@
 #include "CPUExecutionPlan.h"
 #include "GPUProcessPriorityMonitor.h"
 #include "CPUStatus.h"
+#include <filesystem>
 #include <optional>
 
 #include "UnitState.h"
@@ -77,6 +78,7 @@ namespace FAH {
       unsigned viewerFrame = 0;
       int      viewerFail  = 0;
       uint64_t viewerBytes = 0;
+      std::optional<std::filesystem::file_time_type> viewerTopologyBeforeLaunch;
 
       cb::SmartPointer<CoreProcess> process;
       cb::SmartPointer<cb::TailFileToLog> logCopier;
@@ -199,7 +201,8 @@ namespace FAH {
       void setState(UnitState state);
       void next();
 
-      void processStarted(const cb::SmartPointer<CoreProcess> &process);
+      void processStarted(const cb::SmartPointer<CoreProcess> &process,
+        std::optional<std::filesystem::file_time_type> oldViewerTopology);
       void processEnded();
       void skewTimer();
       double getKnownProgress() const;

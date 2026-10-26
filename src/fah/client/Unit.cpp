@@ -675,7 +675,8 @@ void Unit::next() {
 }
 
 
-void Unit::processStarted(const SmartPointer<CoreProcess> &process) {
+void Unit::processStarted(const SmartPointer<CoreProcess> &process,
+                          optional<filesystem::file_time_type> oldViewerTopology) {
   affinityRejections = 0;
   affinityRejectionLogged = false;
   rejectedAffinityCPUs.clear();
@@ -686,11 +687,18 @@ void Unit::processStarted(const SmartPointer<CoreProcess> &process) {
   auto pid = process->getPID();
   LOG_INFO(3, "Started FahCore on PID " << pid);
   this->process = process;
+  viewerTopologyBeforeLaunch = oldViewerTopology;
+  topology = {};
+  frames.clear();
+  viewerFrame = 0;
+  viewerFail = 0;
+  viewerBytes = 0;
   lastSkewTimer = processStartTime = Time::now();
   lastKnownDone = lastKnownTotal = lastKnownProgressUpdate = clockSkew = 0;
   lastKnownProgressUpdateRunTime = getRunTime(); // Start the stall timer
   insert("start_time", Time(processStartTime).toString());
   insert("pid", pid);
+  insert("frames", 0);
 }
 
 
@@ -1012,11 +1020,17 @@ void Unit::run() {
   }
 
   attemptedAffinityCPUs = desired.mask;
+  optional<filesystem::file_time_type> oldViewerTopology;
+  {
+    error_code error;
+    auto time = filesystem::last_write_time(getDirectory() + "/viewerTop.json", error);
+    if (!error) oldViewerTopology = time;
+  }
   process->exec(args);
   // Publish live ownership only after exec succeeds. Rejection handling retains
   // the attempted mask separately, without claiming CPUs for a failed launch.
   runningAllocation = desired;
-  processStarted(process);
+  processStarted(process, oldViewerTopology);
   startLogCopy(logFile); // Redirect core output to log
   triggerNext();
 
@@ -1057,6 +1071,13 @@ void Unit::readInfo() {
 
 void Unit::readViewerData() {
   if (viewerFail < 0 || getState() < UNIT_CORE) return;
+
+  if (viewerTopologyBeforeLaunch) {
+    error_code error;
+    auto time = filesystem::last_write_time(getDirectory() + "/viewerTop.json", error);
+    if (error || time == *viewerTopologyBeforeLaunch) return;
+    viewerTopologyBeforeLaunch.reset();
+  }
 
   try {
     if (topology.isNull()) readViewerTop();
